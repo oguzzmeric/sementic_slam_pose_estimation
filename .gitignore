@@ -1,0 +1,13 @@
+# Veri ve Modeller
+data/
+models/
+
+# Python Sanal Ortam ve Ön Bellek
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# IDE Ayarları
+.vscode/
+.idea/
