@@ -33,7 +33,7 @@ def test_orb_features():
         # Bulunan noktaları orijinal renkli kare üzerine yemyeşil çiz
         frame_with_keypoints = cv2.drawKeypoints(frame, keypoints, None, color=(0, 255, 0), flags=0)
 
-        # Şov Vakti: Ekrana Bas
+        
         cv2.imshow("ORB Taktiksel Gorus", frame_with_keypoints)
 
         # 'q' tuşuna basarsan çık, yoksa videoyu normal hızında (~30 FPS) oynat
