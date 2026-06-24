@@ -6,9 +6,9 @@ from tqdm import tqdm # İlerleme çubuğu için (Eğer yüklü değilse: pip in
 
 # --- AYARLAR VE YOLLAR ---
 MODEL_PATH = "models/best.pt"
-INPUT_VIDEO = "data/test.mp4"
-OUTPUT_VIDEO = "data/masked_video.mp4"
-OUTPUT_JSON = "data/dynamic_objects.json"
+INPUT_VIDEO = "data/test4.mp4"
+OUTPUT_VIDEO = "data/masked_video4.mp4"
+OUTPUT_JSON = "data/dynamic_objects4.json"
 
 TARGET_WIDTH = 1920
 TARGET_HEIGHT = 1080
