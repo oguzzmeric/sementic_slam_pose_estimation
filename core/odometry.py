@@ -5,7 +5,7 @@ import numpy as np
 class PlanarOdometry:
     def __init__(self, focal=1000.0):
         self.focal = focal
-        self.orb = cv2.ORB_create(nfeatures=1000)
+        self.orb = cv2.ORB_create(nfeatures=1000) # feature extraction ??
         
         index_params = dict(algorithm=6, table_number=6, key_size=12, multi_probe_level=1)
         search_param = dict(checks=50)
@@ -45,3 +45,6 @@ class PlanarOdometry:
         self.prev_descriptors = descriptors
         
         return self.cur_x, self.cur_y, keypoints, good_matches
+    
+    ##orb feature extraction yapar flann da feture matcher ?
+    
