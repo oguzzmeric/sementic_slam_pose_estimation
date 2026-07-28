@@ -1,0 +1,136 @@
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                         PHASE 1 — LOCAL EDGE MVP (GTX 1650)                     ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+RAW VIDEO
+    │
+    ▼
+yolo_preprocessing.py  ──────────────────────────────→  detections.json
+(Offline YOLO inference)                                 (bbox, class_id, conf)
+
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            MAIN LOOP (main.py)                              │
+│                                                                             │
+│  raw_frames/ ──→ data_loader.py ──→ frame (BGR, 1920x1080)                 │
+│                       │                                                     │
+│                       ├──→ detections.json  ──→ [class_id, bbox, conf]     │
+│                       ├──→ ground-truth.csv ──→ [tx, ty] (warmup için)     │
+│                       └──→ config.yaml      ──→ tüm parametreler           │
+│                                                                             │
+│  frame ──→ camera_calibration.py ──→ undistorted frame                     │
+│                                      K, K_inv, fx, fy                      │
+│                                                                             │
+│  undistorted frame                                                          │
+│       │                                                                     │
+│       ▼                                                                     │
+│  feature_extractor.py                                                       │
+│       ├── Semantic mask (YOLO bbox → dynamic class'lar maskelenir)          │
+│       ├── ORB detect (FAST keypoints)                                       │
+│       ├── ORB describe (rBRIEF descriptors)                                 │
+│       └──→ FrameFeatures (keypoints, descriptors, mask, clean_frame)       │
+│                                                                             │
+│  FrameFeatures(prev) + FrameFeatures(curr)                                  │
+│       │                                                                     │
+│       ▼                                                                     │
+│  matcher.py                                                                 │
+│       ├── BF Matcher + Hamming Distance (kNN, k=2)                         │
+│       ├── Lowe's Ratio Test (d1/d2 < 0.75)                                 │
+│       └──→ MatchResult (pts_prev, pts_curr, matches)                       │
+│                                                                             │
+│  MatchResult                                                                │
+│       │                                                                     │
+│       ▼                                                                     │
+│  motion_estimator.py                                                        │
+│       ├── findHomography (RANSAC) ──→ H, S_H                               │
+│       ├── findEssentialMat (RANSAC) ──→ E, S_E                             │
+│       ├── R_H = S_H / (S_H + S_E)                                          │
+│       ├── R_H > 0.45 → H seç → _decompose_homography (DLT + cheirality)   │
+│       ├── R_H ≤ 0.45 → E seç → recoverPose                                │
+│       ├── R validasyonu (det, ortogonallik, açı < 30°)                     │
+│       └──→ PoseEstimate (R, t_unit, inliers, matrix_type)                  │
+│                                                                             │
+│       inlier_count < 40?                                                    │
+│       └── ⚠️ deep_features fallback uyarısı (Phase 2'de aktif olacak)      │
+│                                                                             │
+│  PoseEstimate                                                               │
+│       │                                                                     │
+│       ▼                                                                     │
+│  scale_recovery.py                                                          │
+│       │                                                                     │
+│       ├── frame < 150 (WARMUP)                                             │
+│       │       ├── GT displacement = t_GT_curr - t_GT_prev                  │
+│       │       ├── s = ||GT_disp|| / ||t_unit_xy||                          │
+│       │       ├── Moving median (window=20)                                 │
+│       │       └──→ t_scaled = s * t_unit                                   │
+│       │                                                                     │
+│       └── frame ≥ 150 (AUTONOMOUS)                                         │
+│               ├── YOLO bbox → h_pixel                                      │
+│               ├── Z = (f_y * H_real) / h_pixel                            │
+│               ├── scale = Z * |t_z| / ||t||                                │
+│               ├── Başarısız → warmup median fallback                        │
+│               └──→ t_scaled = s * t_unit                                   │
+│                                                                             │
+│  ScaleResult (scale, t_scaled, mode, depth)                                 │
+│       │                                                                     │
+│       ▼                                                                     │
+│  pose_graph.py           ← SIRADA BU VAR                                   │
+│       ├── T_world güncelle                                                  │
+│       │   T_world = T_world * [R | t_scaled]                               │
+│       │                                                                     │
+│       └──→ trajectory (x, y, z, R_world) per frame                        │
+│                                                                             │
+│  trajectory                                                                 │
+│       │                                                                     │
+│       ▼                                                                     │
+│  visualizer.py           ← SONRA BU                                        │
+│       ├── 2D trajectory plot                                                │
+│       ├── GT vs estimated karşılaştırma                                     │
+│       ├── ATE hesabı                                                        │
+│       └── Debug görsel                                                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+════════════════════════════════════════════════════════════════════════════════
+
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                      PHASE 2 — CLOUD GPU SERVER                                  ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+REAL-TIME VIDEO STREAM
+    │
+    ▼
+YOLO Real-time inference (GPU) ──→ detections (online)
+
+    │
+    ▼
+feature_extractor.py  →  deep_features.py
+  ORB                 →  SuperPoint (self-supervised keypoints)
+  BF+Hamming          →  LightGlue (transformer tabanlı matching)
+
+    │
+    ▼
+motion_estimator.py  →  DEĞİŞMİYOR (aynı H/E hybrid)
+                         (sadece input kalitesi artar)
+
+    │
+    ▼
+scale_recovery.py    →  semantic bbox + MiDaS/DPT FUSION
+                         (monocular depth estimation ile desteklenir)
+
+    │
+    ▼
+pose_graph.py        →  + Loop Closure (DBoW2)
+                         + Bundle Adjustment (g2o/GTSAM)
+                         Birikmiş drift sıfırlanır
+
+    │
+    ▼
+3D Voxel Grid        →  OctoMap tabanlı
+(semantic label'lı)     araç, bina, zemin ayrımı
+
+    │
+    ▼
+visualizer.py        →  3D point cloud render
+                         interactive harita

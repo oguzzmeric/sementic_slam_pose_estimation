@@ -1,0 +1,70 @@
+# =====================================================================
+# DRONE SEMANTIC SLAM & MAPPING CONFIGURATION
+# Veri Seti: 2024 (1920x1080 Nadir Açılı - Düşük Distorsiyon)
+# Phase 1: Local Edge MVP (GTX 1650)
+# Phase 2: Cloud GPU Server
+# =====================================================================
+
+# 1. RGB KAMERA KALİBRASYONU (2024 Değerleri)
+camera_rgb:
+  fx: 1413.3
+  fy: 1418.8
+  cx: 950.0639
+  cy: 543.3796
+  distortion_coefficients: [-0.0091, 0.0666, 0.0, 0.0, 0.0]
+  original_width: 1920
+  original_height: 1080
+
+# 2. VİDEO ÇIKTI BOYUTLARI
+target_resolution:
+  width: 1920
+  height: 1080
+
+# 3. ÖZELLİK ÇIKARMA VE EŞLEŞTİRME (Odometri Motoru)
+# Phase 2'de ORB → SuperPoint, BF+Hamming → LightGlue ile swap edilir
+features:
+  max_features: 3000
+  scale_factor: 1.2
+  n_levels: 8
+  ransac_threshold: 3.0
+  lowe_ratio: 0.75 # Lowe's Ratio Test eşiği
+
+# 4. SEMANTİK MASKELEME VE ÖLÇEKLENDİRME
+semantic:
+  min_confidence: 0.7
+
+  # Dinamik objeler — odometriyi bozar, maskelenir
+  # YOLO class ID → sınıf adı eşleşmesi:
+  # 0: UAP, 1: INSAN, 2: MOTOR, 3: ARABA,
+  # 4: KAMYON, 5: OTOBUS, 6: UAI, 7: MAKINE, 8: GEMI, 9: TREN
+  dynamic_classes: [1, 2, 3, 4, 5, 8, 9]
+
+  # Metrik referanslar — semantic scale recovery için (frame >= 150)
+  # Sadece boyutu iyi bilinen ve sık görülen objeler
+  reference_objects:
+    2: 1.5 # MOTOR   (1.5 metre)
+    3: 4.5 # ARABA   (4.5 metre)
+    4: 7.0 # KAMYON  (7.0 metre)
+    5: 12.0 # OTOBUS  (12.0 metre)
+
+# 5. HİBRİT MOTION ESTIMATION
+# Her frame çiftinde H ve E paralel hesaplanır
+# S_H > S_E → Homography seç
+# S_E >= S_H → Essential Matrix seç
+hybrid:
+  min_inlier_count: 40 # Bu eşiğin altında → deep_features.py devreye girer
+  deep_feature_interval: 20 # Phase 2: her N frame'de bir SuperPoint/LightGlue çalışır
+
+# 6. GROUND TRUTH VE DEĞERLENDİRME
+evaluation:
+  ground_truth_file: "data/ground-truth.csv"
+  warmup_frames: 300 # İlk 150 frame GT scale kullanır, sonrası semantic scale
+  calculate_ate: true # Absolute Trajectory Error hesabı
+  force_2d: true
+  flip_y: true
+  swap_xy: true
+# 7. LOGLAMA
+logging:
+  level: "INFO" # DEBUG | INFO | WARNING | ERROR
+  log_to_file: false
+  log_file: "logs/slam.log"
