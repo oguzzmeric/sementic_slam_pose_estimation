@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
+from torch import gt
 
 logger = logging.getLogger(__name__)
 
@@ -121,12 +122,11 @@ class Visualizer:
 
         for i, (label, color) in enumerate(zip(labels, colors_est)):
             ax = axes[i]
-            ax.plot(est[:, i], color=color, linewidth=1.5, label=f'Est {label}')
-            if i < 2:
-                ax.plot(gt[:, i], color='black', linewidth=1.5, linestyle='--', label=f'GT {label}')
+            ax.plot(est[:, i], color=color, lw=1.5, label=f'Est {label}')
+            ax.plot(gt[:, i], color='black', lw=1.5, ls='--', label=f'GT {label}')
             ax.set_ylabel(f'{label} (m)')
             ax.legend()
-            ax.grid(True, alpha=0.3)
+            ax.grid(alpha=0.3)
 
         axes[-1].set_xlabel('Frame')
         plt.suptitle('X, Y, Z Components Over Time')

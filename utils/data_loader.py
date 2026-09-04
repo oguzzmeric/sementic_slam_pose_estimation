@@ -25,21 +25,26 @@ class DataLoaderError(Exception):
 
 
 class GroundTruthRecord:
-    """Tek bir GT kaydını temsil eder."""
-    __slots__ = ("frame_name", "tx", "ty")
+    """Tek bir GT kaydi. Z ekseni opsiyonel."""
+    __slots__ = ("frame_name", "tx", "ty", "tz")
 
-    def __init__(self, frame_name: str, tx: float, ty: float) -> None:
+    def __init__(self, frame_name: str, tx: float, ty: float, tz: float = 0.0) -> None:
         self.frame_name = frame_name
         self.tx = tx
         self.ty = ty
+        self.tz = tz
 
     def as_vector(self) -> np.ndarray:
-        """[tx, ty] vektörünü döndürür."""
+        """[tx, ty, tz] — uc boyutlu."""
+        return np.array([self.tx, self.ty, self.tz], dtype=np.float64)
+
+    def as_vector_xy(self) -> np.ndarray:
+        """[tx, ty] — Z olmayan veri setleriyle uyumluluk icin."""
         return np.array([self.tx, self.ty], dtype=np.float64)
 
     def __repr__(self) -> str:
-        return f"GroundTruthRecord(frame={self.frame_name}, tx={self.tx:.6f}, ty={self.ty:.6f})"
-
+        return (f"GroundTruthRecord(frame={self.frame_name}, "
+                f"tx={self.tx:.6f}, ty={self.ty:.6f}, tz={self.tz:.6f})")
 
 class Detection:
     """Tek bir YOLO tespitini temsil eder."""
@@ -154,6 +159,10 @@ class DataLoader:
         # Lexicographic sort — isimlendirme formatından bağımsız çalışır
         frames.sort(key=lambda p: p.name)
         logger.info("[DataLoader] %d frame bulundu.", len(frames))
+        step = int(self.config.get("evaluation", {}).get("frame_step", 1))
+        if step > 1:
+            frames = frames[::step]
+            logger.info("[DataLoader] Frame adım sayısı: %d, seçilen frame sayısı: %d", step, len(frames))
         return frames
 
     @property
@@ -240,10 +249,14 @@ class DataLoader:
                         frame_name = row["frame_numbers"].strip()
                         tx = float(row["translation_x"])
                         ty = float(row["translation_y"])
-                        index[frame_name] = GroundTruthRecord(frame_name, tx, ty)
+                        # translation_z opsiyonel — olmayan veri setinde 0
+                        tz_raw = row.get("translation_z", "")
+                        tz = float(tz_raw) if tz_raw not in (None, "") else 0.0
+                        index[frame_name] = GroundTruthRecord(frame_name, tx, ty, tz)
                     except (ValueError, KeyError) as e:
                         logger.warning(
-                            "[DataLoader] GT satır %d parse hatası, atlanıyor: %s", line_num, e
+                            "[DataLoader] GT satir %d parse hatasi, atlaniyor: %s",
+                            line_num, e,
                         )
                         continue
 

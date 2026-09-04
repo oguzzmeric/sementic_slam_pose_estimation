@@ -1,19 +1,45 @@
 """
 core/scale_recovery.py
 =======================
-Scale recovery module.
-Solves the fundamental monocular constraint: t vector from SVD is unit vector,
-no absolute metric scale exists.
+Monocular scale recovery.
 
-Two modes:
-    1. Warmup (frame < warmup_limit):
-       Real metric scale computed from ground-truth CSV.
-       s = ||t_GT|| / ||t_est_xy||
+The translation vector from SVD decomposition is a unit vector -- it carries
+direction but no magnitude. This module recovers the metric magnitude.
 
-    2. Autonomous (frame >= warmup_limit):
-       Uses warmup median scale as base.
-       Depth from YOLO bbox is used for reference only.
-       Z = (f_y * H_real) / h_pixel
+Deployment model
+----------------
+In a real mission the module engages when GNSS is lost, not at take-off.
+At that moment the aircraft still has:
+    - last GNSS fix        -> starting position
+    - barometer / rangefinder -> altitude, unaffected by the outage
+    - IMU, magnetometer
+
+So the warmup phase does not have to sit at the start of the flight.
+`warmup_start` lets it begin anywhere, simulating the outage instant.
+
+During the warmup window the reference signal (ground truth here, GNSS in
+deployment) is used to learn two things:
+    s_ref     : metric displacement per frame
+    k         : depth-to-scale coefficient, k = s_ref / Z
+
+After the window closes the reference is never read again.
+
+Altitude sources
+----------------
+    semantic : Z estimated from YOLO bounding boxes
+    gt       : Z read from ground truth (barometer equivalent)
+    hybrid   : gt when available, semantic otherwise
+
+Depth from bounding box (pinhole model, nadir view):
+
+     A = (f_y * H_real * cos^2(theta)) / d_pixel
+
+  d_pixel : dominant bbox edge -- max(width, height). In nadir view the
+            bbox is axis-aligned, so a vehicle heading east-west yields a
+            short bbox height even though length is the reference metric.
+  cos^2   : off-axis correction. The naive formula assumes the object lies
+            on the optical axis. Slant range grows as 1/cos(theta) and the
+            ground patch foreshortens by cos(theta); the two compound.
 """
 
 import logging
@@ -35,6 +61,23 @@ class ScaleRecoveryError(Exception):
 
 
 @dataclass
+class DepthEstimate:
+    """Single altitude measurement from one bounding box."""
+    depth: float
+    depth_raw: float
+    class_id: int
+    confidence: float
+    quality: float
+    radial_px: float
+    cos2: float
+    d_pixel: float
+
+    def __repr__(self) -> str:
+        return (f"DepthEstimate(Z={self.depth:.2f}m, raw={self.depth_raw:.2f}m, "
+                f"cls={self.class_id}, q={self.quality:.3f})")
+
+
+@dataclass
 class ScaleResult:
     scale: float
     t_scaled: np.ndarray
@@ -43,20 +86,33 @@ class ScaleResult:
     frame_name: str
     reference_class: Optional[int] = None
     estimated_depth: Optional[float] = None
+    depth_source: Optional[str] = None
 
     def __repr__(self) -> str:
-        depth_str = f"{self.estimated_depth:.2f}m" if self.estimated_depth is not None else "N/A"
-        return (
-            f"ScaleResult("
-            f"frame={self.frame_name}, "
-            f"mode={self.mode}, "
-            f"scale={self.scale:.4f}, "
-            f"depth={depth_str}, "
-            f"valid={self.is_valid})"
-        )
+        dep = f"{self.estimated_depth:.2f}m" if self.estimated_depth is not None else "N/A"
+        return (f"ScaleResult(frame={self.frame_name}, mode={self.mode}, "
+                f"scale={self.scale:.4f}, Z={dep}, src={self.depth_source}, "
+                f"valid={self.is_valid})")
 
 
 class ScaleRecovery:
+    """
+    Recovers metric scale for monocular visual odometry.
+
+    Timeline:
+        frame < warmup_start                    -> pre-warmup, fixed unit scale
+        warmup_start <= frame < warmup_end      -> learning from reference
+        frame >= warmup_end                     -> autonomous
+    """
+
+    _MIN_DEPTH = 1.0
+    _MAX_DEPTH = 500.0
+    _MIN_BBOX_PX = 12
+    _SCALE_LOWER_MULT = 0.30
+    _SCALE_UPPER_MULT = 3.00
+    _DEPTH_WINDOW = 7
+    _MIN_K_SAMPLES = 5
+
     def __init__(
         self,
         data_loader: DataLoader,
@@ -67,29 +123,58 @@ class ScaleRecovery:
         self._loader = data_loader
         self._cam = camera_calibration
 
+
         eval_cfg = data_loader.get_evaluation_config()
         sem_cfg = data_loader.get_semantic_config()
 
-        self._warmup_limit = self._parse_warmup_limit(eval_cfg)
+        
+
+        self._warmup_start = int(eval_cfg.get("warmup_start", 0))
+        self._warmup_len = int(eval_cfg.get("warmup_frames", 150))
+        self._warmup_end = self._warmup_start + self._warmup_len
+
+        self._altitude_source = str(eval_cfg.get("altitude_source", "semantic")).lower()
+        if self._altitude_source not in ("semantic", "gt", "hybrid"):
+            raise ScaleRecoveryError(
+                f"altitude_source must be semantic/gt/hybrid, got '{self._altitude_source}'"
+            )
+        self._gt_z_down = bool(eval_cfg.get("gt_z_is_down", False))
+        self._gt_z_offset = float(eval_cfg.get("gt_z_offset", 0.0))
+
         self._reference_objects = self._parse_reference_objects(sem_cfg)
         self._min_confidence = float(sem_cfg.get("min_confidence", 0.7))
-        self._fy = camera_calibration.fy
+        self._use_cos2 = bool(sem_cfg.get("perspective_correction", True))
+        self._use_dominant_edge = bool(sem_cfg.get("dominant_bbox_edge", True))
 
-        self._scale_history: Deque[float] = deque(maxlen=20)
+        self._fx = camera_calibration.fx
+        self._fy = camera_calibration.fy
+        self._cx = camera_calibration.cx
+        self._cy = camera_calibration.cy
+        self._f = float(np.sqrt(self._fx * self._fy))
+
+        # learned during warmup
+        self._scale_history: Deque[float] = deque(maxlen=60)
+        self._k_history: List[float] = []
         self._warmup_scale_mean: Optional[float] = None
+        self._k_factor: Optional[float] = None
+        self._calibrated: bool = False
+
+        # diagnostics: bbox depth vs reference altitude
+        self._depth_pairs: List[Tuple[float, float]] = []
+
+        self._depth_window: Deque[float] = deque(maxlen=self._DEPTH_WINDOW)
         self._frame_count: int = 0
 
         logger.info(
-            "[ScaleRecovery] Ready — warmup_limit=%d, reference_classes=%s",
-            self._warmup_limit,
-            list(self._reference_objects.keys()),
+            "[ScaleRecovery] Ready -- warmup [%d, %d), altitude_source=%s, "
+            "cos2=%s, dominant_edge=%s",
+            self._warmup_start, self._warmup_end, self._altitude_source,
+            self._use_cos2, self._use_dominant_edge,
         )
 
-    @staticmethod
-    def _parse_warmup_limit(eval_cfg: dict) -> int:
-        if "warmup_frames" not in eval_cfg:
-            raise ScaleRecoveryError("evaluation config missing 'warmup_frames'.")
-        return int(eval_cfg["warmup_frames"])
+    # ------------------------------------------------------------------
+    # config
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _parse_reference_objects(sem_cfg: dict) -> dict:
@@ -97,207 +182,380 @@ class ScaleRecovery:
             raise ScaleRecoveryError("semantic config missing 'reference_objects'.")
         return {int(k): float(v) for k, v in sem_cfg["reference_objects"].items()}
 
-    def _compute_warmup_scale(
-        self,
-        pose: PoseEstimate,
-        frame_name: str,
-    ) -> Optional[float]:
+    # ------------------------------------------------------------------
+    # bbox geometry
+    # ------------------------------------------------------------------
+
+    def _bbox_geometry(self, bbox: List[int]) -> Tuple[float, float, float]:
+        """
+        Returns (d_pixel, radial_px, cos2).
+
+        d_pixel   : dominant bbox edge, orientation independent
+        radial_px : bbox centre distance from principal point
+        cos2      : cos^2(theta) off-axis correction factor
+        """
+        x1, y1, x2, y2 = bbox
+        w = abs(x2 - x1)
+        h = abs(y2 - y1)
+
+        d_pixel = float(max(w, h)) if self._use_dominant_edge else float(h)
+
+        u_c = (x1 + x2) / 2.0
+        v_c = (y1 + y2) / 2.0
+        radial_px = float(np.hypot(u_c - self._cx, v_c - self._cy))
+
+        if self._use_cos2:
+            theta = np.arctan2(radial_px, self._f)
+            cos2 = float(np.cos(theta) ** 2)
+        else:
+            cos2 = 1.0
+
+        return d_pixel, radial_px, cos2
+
+    def _depth_from_detection(self, det: Detection) -> Optional[DepthEstimate]:
+        if det.class_id not in self._reference_objects:
+            return None
+        if det.confidence < self._min_confidence:
+            return None
+
+        bbox = det.bbox
+        if len(bbox) != 4:
+            return None
+
+        x1, y1, x2, y2 = bbox
+        w, h = abs(x2 - x1), abs(y2 - y1)
+        if w < self._MIN_BBOX_PX or h < self._MIN_BBOX_PX:
+            return None
+
+        d_pixel, radial_px, cos2 = self._bbox_geometry(bbox)
+        if d_pixel < 1e-6:
+            return None
+
+        H_real = self._reference_objects[det.class_id]
+        depth_raw = (self._fy * H_real) / d_pixel
+        depth = depth_raw * cos2
+
+        if not (self._MIN_DEPTH <= depth <= self._MAX_DEPTH):
+            return None
+
+        # Confidence measures classification certainty, not localisation
+        # quality, so it is combined with the off-axis penalty.
+        quality = det.confidence * cos2
+
+        return DepthEstimate(
+            depth=depth, depth_raw=depth_raw, class_id=det.class_id,
+            confidence=det.confidence, quality=quality,
+            radial_px=radial_px, cos2=cos2, d_pixel=d_pixel,
+        )
+
+    def _semantic_depth(self, frame_name: str) -> Optional[DepthEstimate]:
+        """
+        Altitude above ground from the reference channel.
+
+        The dataset uses a NED-style convention: Z grows downward and is
+        measured relative to the launch point. Absolute altitude is
+
+            Z_agl = z_offset - z_gt          (down-positive)
+            Z_agl = z_offset + z_gt          (up-positive)
+
+        In deployment a barometer reports absolute altitude directly and
+        this conversion is not needed.
+        """
+        gt = self._loader.get_ground_truth(frame_name)
+        if gt is None:
+            return None
+
+        z_rel = float(gt.tz)
+        z = (self._gt_z_offset - z_rel) if self._gt_z_down \
+            else (self._gt_z_offset + z_rel)
+
+        if not (self._MIN_DEPTH <= z <= self._MAX_DEPTH):
+            return None
+        return z
+
+    # ------------------------------------------------------------------
+    # altitude
+    # ------------------------------------------------------------------
+
+    def _gt_altitude(self, frame_name: str) -> Optional[float]:
+        """
+        Altitude above ground from the reference channel.
+
+        This dataset uses a NED-style convention: Z grows downward and is
+        measured relative to the launch point. Absolute altitude is
+
+            z_down_positive : Z_agl = offset - z_gt
+            z_up_positive   : Z_agl = offset + z_gt
+
+        In deployment a barometer reports absolute altitude directly and
+        this conversion is not needed.
+        """
+        gt = self._loader.get_ground_truth(frame_name)
+        if gt is None:
+            return None
+
+        z_rel = float(gt.tz)
+        z = (self._gt_z_offset - z_rel) if self._gt_z_down \
+            else (self._gt_z_offset + z_rel)
+
+        if not (self._MIN_DEPTH <= z <= self._MAX_DEPTH):
+            return None
+        return z
+
+    def _altitude(self, frame_name: str) -> Tuple[Optional[float], Optional[int], str]:
+        """
+        Resolves altitude according to the configured source.
+
+        Returns (altitude, class_id, source_label).
+        """
+        if self._altitude_source == "gt":
+            z = self._gt_altitude(frame_name)
+            return (z, None, "gt") if z is not None else (None, None, "none")
+
+        if self._altitude_source == "semantic":
+            est = self._semantic_depth(frame_name)
+            return (est.depth, est.class_id, "semantic") if est else (None, None, "none")
+
+        # hybrid
+        z = self._gt_altitude(frame_name)
+        if z is not None:
+            return z, None, "gt"
+        est = self._semantic_depth(frame_name)
+        return (est.depth, est.class_id, "semantic") if est else (None, None, "none")
+
+    def _smoothed(self, depth: float) -> float:
+        """
+        Rolling median. Bbox regression jitters frame to frame and depth is
+        inversely proportional to bbox size, so raw depth is noisy. Altitude
+        itself changes slowly, so a short window removes jitter without lag.
+        """
+        self._depth_window.append(depth)
+        return float(np.median(self._depth_window))
+
+    # ------------------------------------------------------------------
+    # warmup
+    # ------------------------------------------------------------------
+
+    def _reference_scale(self, pose: PoseEstimate, frame_name: str) -> Optional[float]:
+        """
+        Metric displacement between two frames, from the reference channel.
+
+            s = ||delta_ref|| / ||t||
+
+        t is a unit vector, so the full 3D norm is used -- projecting onto
+        XY would discard the vertical component that the reference provides.
+        """
         gt_curr = self._loader.get_ground_truth(frame_name)
         gt_prev = self._loader.get_ground_truth(pose.frame_name_prev)
-
         if gt_curr is None or gt_prev is None:
-            logger.warning("[ScaleRecovery] GT not found: %s or %s", frame_name, pose.frame_name_prev)
             return None
 
-        gt_displacement = gt_curr.as_vector() - gt_prev.as_vector()
-        gt_norm = np.linalg.norm(gt_displacement)
-
-        if gt_norm < 1e-9:
-            logger.debug("[ScaleRecovery] GT displacement near zero: %s", frame_name)
+        delta = gt_curr.as_vector() - gt_prev.as_vector()
+        d_norm = float(np.linalg.norm(delta))
+        if d_norm < 1e-9:
             return None
 
-        t_xy = pose.t.flatten()[:2]
-        t_xy_norm = np.linalg.norm(t_xy)
-
-        if t_xy_norm < 1e-9:
-            logger.warning("[ScaleRecovery] VO t_xy near zero: %s", frame_name)
+        t_norm = float(np.linalg.norm(pose.t))
+        if t_norm < 1e-9:
             return None
 
-        scale = gt_norm / t_xy_norm
-
-        if not (0.01 <= scale <= 50.0):
-            logger.debug("[ScaleRecovery] Unreasonable warmup scale (%.2f), skipping.", scale)
+        scale = d_norm / t_norm
+        if not (1e-4 <= scale <= 50.0):
+            logger.debug("[ScaleRecovery] Reference scale %.5f out of range.", scale)
             return None
-
-        logger.debug("[ScaleRecovery] Warmup scale: GT=%.4f, t_xy=%.4f, s=%.4f", gt_norm, t_xy_norm, scale)
         return scale
 
-    def _estimate_depth_from_bbox(
-        self,
-        detections: List[Detection],
-    ) -> Tuple[Optional[float], Optional[int]]:
-        best_depth = None
-        best_class = None
-        best_confidence = -1.0
+    def _finalize(self) -> None:
+        """Closes the warmup window and fixes the calibrated constants."""
+        self._calibrated = True
 
-        for det in detections:
-            if det.class_id not in self._reference_objects:
-                continue
-            if det.confidence < self._min_confidence:
-                continue
-
-            x1, y1, x2, y2 = det.bbox
-            h_pixel = abs(y2 - y1)
-            w_pixel = abs(x2 - x1)
-
-            if h_pixel < 10 or w_pixel < 10:
-                continue
-
-            H_real = self._reference_objects[det.class_id]
-            depth = (self._fy * H_real) / h_pixel
-
-            if not (1.0 <= depth <= 500.0):
-                continue
-
-            if det.confidence > best_confidence:
-                best_confidence = det.confidence
-                best_depth = depth
-                best_class = det.class_id
-
-        return best_depth, best_class
-
-    def _compute_autonomous_scale(
-        self,
-        pose: PoseEstimate,
-        frame_name: str,
-    ) -> Tuple[Optional[float], Optional[float], Optional[int]]:
-        detections = self._loader.get_detections(frame_name)
-
-        if not detections:
-            logger.debug("[ScaleRecovery] No detections: %s", frame_name)
-            return None, None, None
-
-        depth, class_id = self._estimate_depth_from_bbox(detections)
-
-        if depth is None:
-            logger.debug("[ScaleRecovery] No valid reference object: %s", frame_name)
-            return None, None, None
-
-        # Use warmup median scale as base — depth is reference only
-        if self._warmup_scale_mean is not None:
-            scale = self._warmup_scale_mean
+        if self._scale_history:
+            self._warmup_scale_mean = float(np.median(self._scale_history))
         else:
-            scale = 1.0
+            self._warmup_scale_mean = 1.0
+            logger.warning("[ScaleRecovery] No warmup scale samples; defaulting to 1.0")
 
-        logger.debug(
-            "[ScaleRecovery] Autonomous scale: depth=%.2fm, class=%d, scale=%.4f",
-            depth, class_id, scale,
-        )
-        return scale, depth, class_id
+        if len(self._k_history) >= self._MIN_K_SAMPLES:
+            self._k_factor = float(np.median(self._k_history))
+            logger.info(
+                "[ScaleRecovery] Warmup closed -- scale=%.5f (%d), k=%.6f (%d, std=%.6f)",
+                self._warmup_scale_mean, len(self._scale_history),
+                self._k_factor, len(self._k_history), float(np.std(self._k_history)),
+            )
+        else:
+            self._k_factor = None
+            logger.warning(
+                "[ScaleRecovery] Warmup closed -- scale=%.5f, only %d k samples. "
+                "Autonomous mode falls back to fixed scale.",
+                self._warmup_scale_mean, len(self._k_history),
+            )
 
-    def recover(
-        self,
-        pose: PoseEstimate,
-        frame_name: str,
-    ) -> ScaleResult:
+        if len(self._depth_pairs) >= 5:
+            a = np.array(self._depth_pairs)
+            ratio = a[:, 0] / np.maximum(a[:, 1], 1e-9)
+            logger.info(
+                "[ScaleRecovery] Depth check -- bbox/reference ratio: "
+                "median=%.3f mean=%.3f std=%.3f (n=%d)",
+                float(np.median(ratio)), float(np.mean(ratio)),
+                float(np.std(ratio)), len(a),
+            )
+
+    # ------------------------------------------------------------------
+    # autonomous
+    # ------------------------------------------------------------------
+
+    def _autonomous(
+        self, frame_name: str,
+    ) -> Tuple[Optional[float], Optional[float], Optional[int], str]:
+        z, cls, src = self._altitude(frame_name)
+        if z is None:
+            return None, None, None, src
+
+        z = self._smoothed(z)
+
+        if self._k_factor is None:
+            return None, z, cls, src
+
+        scale = self._k_factor * z
+
+        base = self._warmup_scale_mean or 1.0
+        lo, hi = self._SCALE_LOWER_MULT * base, self._SCALE_UPPER_MULT * base
+        if not (lo <= scale <= hi):
+            logger.debug(
+                "[ScaleRecovery] Scale %.5f outside [%.5f, %.5f], falling back. Z=%.2f",
+                scale, lo, hi, z,
+            )
+            return None, z, cls, src
+
+        return scale, z, cls, src
+
+    # ------------------------------------------------------------------
+    # public API
+    # ------------------------------------------------------------------
+
+    def recover(self, pose: PoseEstimate, frame_name: str) -> ScaleResult:
         self._frame_count += 1
+        idx = self._frame_count
 
         if not pose.is_valid or pose.t is None:
             return ScaleResult(
-                scale=0.0,
-                t_scaled=np.zeros((3, 1)),
-                mode="none",
-                is_valid=False,
-                frame_name=frame_name,
+                scale=0.0, t_scaled=np.zeros((3, 1)), mode="none",
+                is_valid=False, frame_name=frame_name,
             )
 
-        # Warmup mode
-        if self._frame_count <= self._warmup_limit:
-            scale = self._compute_warmup_scale(pose, frame_name)
-
-            if scale is not None:
-                self._scale_history.append(scale)
-
-            if len(self._scale_history) > 0:
-                mean_scale = float(np.median(self._scale_history))
-            else:
-                mean_scale = 1.0
-
-            if self._frame_count == self._warmup_limit:
-                self._warmup_scale_mean = float(np.median(self._scale_history))
-                logger.info(
-                    "[ScaleRecovery] Warmup complete. Median scale=%.4f (%d samples)",
-                    self._warmup_scale_mean,
-                    len(self._scale_history),
-                )
-
-            t_scaled = mean_scale * pose.t
+        # --------------------------------------------------------------
+        # before the warmup window opens
+        # --------------------------------------------------------------
+        if idx < self._warmup_start:
             return ScaleResult(
-                scale=mean_scale,
-                t_scaled=t_scaled,
-                mode="warmup",
-                is_valid=True,
-                frame_name=frame_name,
+                scale=1.0, t_scaled=pose.t.copy(), mode="pre_warmup",
+                is_valid=True, frame_name=frame_name,
             )
 
-        # Autonomous mode
-        scale, depth, class_id = self._compute_autonomous_scale(pose, frame_name)
+        # --------------------------------------------------------------
+        # inside the warmup window -- learn
+        # --------------------------------------------------------------
+        if idx < self._warmup_end:
+            s_ref = self._reference_scale(pose, frame_name)
+            if s_ref is not None:
+                self._scale_history.append(s_ref)
+
+            z, cls, src = self._altitude(frame_name)
+            if s_ref is not None and z is not None and z > 1e-9:
+                self._k_history.append(s_ref / z)
+
+            # diagnostic: how well does bbox depth track reference altitude
+            if self._altitude_source != "gt":
+                est = self._semantic_depth(frame_name)
+                z_ref = self._gt_altitude(frame_name)
+                if est is not None and z_ref is not None:
+                    self._depth_pairs.append((est.depth, z_ref))
+
+            running = float(np.median(self._scale_history)) if self._scale_history else 1.0
+
+            if idx == self._warmup_end - 1:
+                self._finalize()
+
+            return ScaleResult(
+                scale=running, t_scaled=running * pose.t, mode="warmup",
+                is_valid=True, frame_name=frame_name,
+                reference_class=cls, estimated_depth=z, depth_source=src,
+            )
+
+        # --------------------------------------------------------------
+        # autonomous -- reference channel is no longer read
+        # --------------------------------------------------------------
+        if not self._calibrated:
+            self._finalize()
+
+        scale, z, cls, src = self._autonomous(frame_name)
 
         if scale is None:
-            fallback_scale = self._warmup_scale_mean if self._warmup_scale_mean else 1.0
-            t_scaled = fallback_scale * pose.t
+            fb = self._warmup_scale_mean or 1.0
             return ScaleResult(
-                scale=fallback_scale,
-                t_scaled=t_scaled,
-                mode="autonomous_fallback",
-                is_valid=True,
-                frame_name=frame_name,
-                reference_class=class_id,
-                estimated_depth=depth,
+                scale=fb, t_scaled=fb * pose.t, mode="autonomous_fallback",
+                is_valid=True, frame_name=frame_name,
+                reference_class=cls, estimated_depth=z, depth_source=src,
             )
 
-        t_scaled = scale * pose.t
         return ScaleResult(
-            scale=scale,
-            t_scaled=t_scaled,
-            mode="autonomous",
-            is_valid=True,
-            frame_name=frame_name,
-            reference_class=class_id,
-            estimated_depth=depth,
+            scale=scale, t_scaled=scale * pose.t, mode="autonomous",
+            is_valid=True, frame_name=frame_name,
+            reference_class=cls, estimated_depth=z, depth_source=src,
         )
+
+    # ------------------------------------------------------------------
 
     @property
     def is_warmup_complete(self) -> bool:
-        return self._frame_count > self._warmup_limit
+        return self._frame_count >= self._warmup_end
 
     @property
     def warmup_scale(self) -> Optional[float]:
         return self._warmup_scale_mean
 
-    def __repr__(self) -> str:
-        return (
-            f"ScaleRecovery("
-            f"warmup_limit={self._warmup_limit}, "
-            f"frame_count={self._frame_count}, "
-            f"warmup_complete={self.is_warmup_complete})"
-        )
+    @property
+    def k_factor(self) -> Optional[float]:
+        return self._k_factor
 
+    @property
+    def depth_check(self) -> Optional[dict]:
+        """bbox depth vs reference altitude, collected during warmup."""
+        if len(self._depth_pairs) < 5:
+            return None
+        a = np.array(self._depth_pairs)
+        ratio = a[:, 0] / np.maximum(a[:, 1], 1e-9)
+        return {
+            "n": len(a),
+            "median": float(np.median(ratio)),
+            "mean": float(np.mean(ratio)),
+            "std": float(np.std(ratio)),
+            "bbox_median": float(np.median(a[:, 0])),
+            "ref_median": float(np.median(a[:, 1])),
+        }
+
+    def __repr__(self) -> str:
+        k = f"{self._k_factor:.6f}" if self._k_factor else "pending"
+        return (f"ScaleRecovery(warmup=[{self._warmup_start},{self._warmup_end}), "
+                f"src={self._altitude_source}, frames={self._frame_count}, k={k})")
+
+
+# ----------------------------------------------------------------------
+# standalone test
+# ----------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
     from pathlib import Path
 
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
 
     config_path = Path(__file__).resolve().parent.parent / "config.yaml"
 
     try:
-        from utils.data_loader import DataLoader, DataLoaderError
-        from utils.camera_calibration import CameraCalibration, CameraCalibrationError
+        from utils.data_loader import DataLoader
+        from utils.camera_calibration import CameraCalibration
         from core.feature_extractor import FeatureExtractor
         from core.matcher import Matcher
         from core.motion_estimator import MotionEstimator
@@ -307,53 +565,54 @@ if __name__ == "__main__":
         extractor = FeatureExtractor(loader, cam)
         matcher = Matcher(loader)
         estimator = MotionEstimator(loader, cam)
-        scale_recovery = ScaleRecovery(loader, cam)
+        sr = ScaleRecovery(loader, cam)
 
-        print(f"\n{scale_recovery}")
-        print("\n--- Scale Recovery Test (first 300 frames) ---")
+        print(f"\n{sr}\n")
+        LIMIT = 900
+        print(f"--- Scale Recovery Test ({LIMIT} frames) ---")
 
-        prev_features = None
+        prev = None
         results = []
-
         for idx, name, frame in loader.frame_generator():
-            curr_features = extractor.extract(frame, name)
-
-            if prev_features is not None:
-                match_result = matcher.match(prev_features, curr_features)
-                pose = estimator.estimate(match_result)
-                scale_result = scale_recovery.recover(pose, name)
-                results.append(scale_result)
-
-                if idx % 50 == 0:
-                    print(f"\n[{idx}] {scale_result}")
-                    if scale_result.is_valid and pose.is_valid:
-                        print(f"     t_unit  : {pose.t.T}")
-                        print(f"     t_scaled: {scale_result.t_scaled.T}")
-
-            prev_features = curr_features
-
-            if idx >= 300:
+            curr = extractor.extract(frame, name)
+            if prev is not None:
+                pose = estimator.estimate(matcher.match(prev, curr))
+                results.append(sr.recover(pose, name))
+            prev = curr
+            if idx >= LIMIT:
                 break
 
         valid = [r for r in results if r.is_valid]
-        warmup = [r for r in valid if r.mode == "warmup"]
-        autonomous = [r for r in valid if r.mode == "autonomous"]
-        fallback = [r for r in valid if r.mode == "autonomous_fallback"]
+        by_mode = {}
+        for r in valid:
+            by_mode.setdefault(r.mode, []).append(r)
 
         print(f"\n--- Statistics ---")
-        print(f"  Valid              : {len(valid)}/{len(results)}")
-        print(f"  Warmup             : {len(warmup)}")
-        print(f"  Autonomous         : {len(autonomous)}")
-        print(f"  Autonomous fallback: {len(fallback)}")
-        if warmup:
-            scales = [r.scale for r in warmup]
-            print(f"  Warmup scale mean  : {np.mean(scales):.4f}")
-            print(f"  Warmup scale std   : {np.std(scales):.4f}")
-        if scale_recovery.warmup_scale:
-            print(f"  Warmup median scale: {scale_recovery.warmup_scale:.4f}")
-        if autonomous:
-            depths = [r.estimated_depth for r in autonomous if r.estimated_depth]
-            print(f"  Mean autonomous Z  : {np.mean(depths):.2f}m")
+        print(f"  Valid : {len(valid)}/{len(results)}")
+        for m in sorted(by_mode):
+            v = [r.scale for r in by_mode[m]]
+            print(f"  {m:22s} n={len(v):5d}  median={np.median(v):.5f}  "
+                  f"mean={np.mean(v):.5f}  std={np.std(v):.5f}")
+
+        print()
+        print(f"  warmup scale : {sr.warmup_scale}")
+        print(f"  k factor     : {sr.k_factor}")
+
+        dz = [r.estimated_depth for r in valid if r.estimated_depth]
+        if dz:
+            print(f"  altitude     : median {np.median(dz):.2f} m  "
+                  f"range [{min(dz):.1f}, {max(dz):.1f}]")
+
+        dc = sr.depth_check
+        if dc:
+            print()
+            print("  --- bbox depth vs reference altitude ---")
+            print(f"  samples      : {dc['n']}")
+            print(f"  ratio        : median {dc['median']:.3f}  "
+                  f"mean {dc['mean']:.3f}  std {dc['std']:.3f}")
+            print(f"  bbox median  : {dc['bbox_median']:.2f} m")
+            print(f"  ref  median  : {dc['ref_median']:.2f} m")
+            print("  (ratio 1.0 = bbox depth matches reference)")
 
     except Exception as e:
         logger.error("Error: %s", e)

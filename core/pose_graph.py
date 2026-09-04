@@ -65,19 +65,16 @@ class PoseGraph:
         self._loader = data_loader
         self._eval_cfg = data_loader.get_evaluation_config()
 
-        # Coordinate frame flags
         self._force_2d = bool(self._eval_cfg.get("force_2d", False))
         self._swap_xy  = bool(self._eval_cfg.get("swap_xy",  False))
         self._flip_y   = bool(self._eval_cfg.get("flip_y",   False))
 
-        # Global pose — 4x4 homogeneous transformation
         self._T_world = np.eye(4, dtype=np.float64)
-
         self._trajectory: List[TrajectoryPoint] = []
         self._frame_idx: int = 0
 
         logger.info(
-            "[PoseGraph] Ready — force_2d=%s, swap_xy=%s, flip_y=%s",
+            "[PoseGraph] Ready -- force_2d=%s, swap_xy=%s, flip_y=%s",
             self._force_2d, self._swap_xy, self._flip_y,
         )
 
@@ -93,27 +90,11 @@ class PoseGraph:
         return T
 
     def _apply_coordinate_transform(self, position: np.ndarray) -> np.ndarray:
-        """
-        Applies coordinate frame corrections to position vector.
-
-        Order:
-            1. swap_xy  : position = [Y, X, Z]
-            2. flip_y   : position[1] = -position[1]
-
-        Args:
-            position: Raw [x, y, z] from T_world.
-
-        Returns:
-            Corrected position vector.
-        """
         pos = position.copy()
-
         if self._swap_xy:
             pos[0], pos[1] = pos[1].copy(), pos[0].copy()
-
         if self._flip_y:
             pos[1] = -pos[1]
-
         return pos
 
     # ------------------------------------------------------------------
@@ -128,7 +109,6 @@ class PoseGraph:
     ) -> TrajectoryPoint:
         self._frame_idx += 1
 
-        # Invalid pose — position unchanged
         if not pose.is_valid or not scale_result.is_valid:
             position = self._apply_coordinate_transform(self._T_world[:3, 3])
             R_world = self._T_world[:3, :3].copy()
@@ -144,25 +124,26 @@ class PoseGraph:
             self._trajectory.append(point)
             return point
 
-        # Build translation vector
+
         t_vec = scale_result.t_scaled.flatten().copy()
 
-        # Zero out Z if force_2d
         if self._force_2d:
+            # Zeroing Z shortens the XY norm. Rescale so the planar step
+            # keeps the metric length that scale recovery assigned to it.
+            n_before = float(np.linalg.norm(t_vec))
             t_vec[2] = 0.0
+            xy = float(np.linalg.norm(t_vec))
+            if xy > 1e-9 and n_before > 1e-9:
+                t_vec *= (n_before / xy)
 
-        # Build and apply local transform
         T_local = self._build_local_transform(pose.R, t_vec)
         self._T_world = self._T_world @ T_local
 
-        # Zero out accumulated Z drift if force_2d
         if self._force_2d:
             self._T_world[2, 3] = 0.0
 
-        # Extract and transform position
         raw_position = self._T_world[:3, 3].copy()
         position = self._apply_coordinate_transform(raw_position)
-
         R_world = self._T_world[:3, :3].copy()
 
         point = TrajectoryPoint(
@@ -177,10 +158,8 @@ class PoseGraph:
         self._trajectory.append(point)
 
         logger.debug(
-            "[PoseGraph] %s raw=[%.3f,%.3f,%.3f] transformed=[%.3f,%.3f,%.3f]",
-            frame_name,
-            raw_position[0], raw_position[1], raw_position[2],
-            position[0], position[1], position[2],
+            "[PoseGraph] %s pos=[%.3f, %.3f, %.3f]",
+            frame_name, position[0], position[1], position[2],
         )
         return point
 
@@ -216,18 +195,23 @@ class PoseGraph:
         for point in self.valid_trajectory:
             gt = data_loader.get_ground_truth(point.frame_name)
             if gt is not None:
-                gt_positions.append([gt.tx, gt.ty, 0.0])
+                gt_positions.append([gt.tx, gt.ty, gt.tz])   # tz artik gercek
             else:
                 gt_positions.append([0.0, 0.0, 0.0])
         return np.array(gt_positions)
 
-    def compute_ate(self, data_loader: DataLoader) -> Optional[float]:
+    def compute_ate(self, data_loader: DataLoader, use_3d: Optional[bool] = None) -> Optional[float]:
         """
-        Absolute Trajectory Error (ATE).
         ATE = sqrt(1/N * sum(||t_GT_i - t_est_i||^2))
-        Both trajectories normalized to origin.
-        Only X, Y used (GT has no Z).
+
+        use_3d None ise config'deki ate_3d degeri kullanilir.
+        Iki veri setini karsilastirirken ayni metrigi kullan --
+        yeni setin 3B ATE'si ile eski setin 2B ATE'si yan yana
+        konulmaz.
         """
+        if use_3d is None:
+            use_3d = bool(self._eval_cfg.get("ate_3d", False))
+
         est_positions = self.get_positions_array()
         gt_positions = self.get_gt_array(data_loader)
 
@@ -236,8 +220,9 @@ class PoseGraph:
             return None
 
         N = min(len(est_positions), len(gt_positions))
-        est = est_positions[:N, :2]
-        gt = gt_positions[:N, :2]
+        dims = 3 if use_3d else 2
+        est = est_positions[:N, :dims]
+        gt = gt_positions[:N, :dims]
 
         est = est - est[0]
         gt = gt - gt[0]
@@ -245,7 +230,7 @@ class PoseGraph:
         errors = np.linalg.norm(est - gt, axis=1)
         ate = float(np.sqrt(np.mean(errors ** 2)))
 
-        logger.info("[PoseGraph] ATE = %.4f m (%d points)", ate, N)
+        logger.info("[PoseGraph] ATE(%dD) = %.4f m (%d points)", dims, ate, N)
         return ate
 
     def save_trajectory(self, output_path: str) -> None:
