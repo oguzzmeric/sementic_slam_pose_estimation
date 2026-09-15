@@ -315,14 +315,14 @@ class MotionEstimator:
             t_cand = ts[i].reshape(3, 1)
  
             t_norm = np.linalg.norm(t_cand)
-            if t_norm < 1e-9:
+            if t_norm < 1e-12:
                 continue
  
             t_unit = t_cand / t_norm
-            P2 = self._K @ np.hstack([R_cand, t_unit])
+            P2 = self._K @ np.hstack([R_cand, t_cand])
  
             # camera 2 centre in world coordinates
-            O2 = (-R_cand.T @ t_unit).flatten()
+            O2 = (-R_cand.T @ t_cand).flatten()
  
             votes = 0
             n_low_parallax = 0
@@ -368,7 +368,7 @@ class MotionEstimator:
  
                 # --- gate 1: cheirality ---
                 Z1 = X[2]
-                X_cam2 = R_cand @ X + t_unit.flatten()
+                X_cam2 = R_cand @ X + t_cand.flatten()
                 Z2 = X_cam2[2]
  
                 if (Z1 <= 0 or Z2 <= 0):
@@ -403,7 +403,7 @@ class MotionEstimator:
             if votes > best_votes:
                 best_votes = votes
                 best_R = R_cand
-                best_t = t_unit
+                best_t = t_cand
                 best_stats = (n_low_parallax, n_behind, n_reproj_fail)
  
         if best_R is None or best_votes <= 0:
@@ -419,6 +419,7 @@ class MotionEstimator:
             "(low_parallax=%d, behind=%d, reproj_fail=%d)",
             best_votes, test_count, lp, bh, rf,
         )
+        best_t = best_t / np.linalg.norm(best_t)  # normalize translation
  
         return best_R, best_t.reshape(3, 1)
 

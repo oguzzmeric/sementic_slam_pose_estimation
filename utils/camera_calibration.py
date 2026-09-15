@@ -112,6 +112,13 @@ class CameraCalibration:
         # [fx  0  cx]
         # [ 0 fy  cy]
         # [ 0  0   1]
+       
+        #Kameranın merceğinin odak uzaklığının piksel cinsinden ifadesidir.
+        #  Yatay (\(f_{x}\)) ve dikey (\(f_{y}\)) eksendeki piksel boyutları (sensör piksellerinin tam kare olmaması durumunda) hafifçe farklılık gösterebilir. 
+        # Bu değer büyüdükçe kamera daha çok "zoom" yapar (görüş açısı daralır), küçüldükçe daha geniş bir açıyı görür
+        
+        #\(c_{x}\) ve \(c_{y}\) (Optik Merkez / Ana Nokta - Principal Point): Kameranın optik ekseninin (merceğin tam merkezinden geçen doğrunun) görüntü sensörüne/ekrana çarptığı yerin piksel koordinatlarıdır. 
+        # Genellikle görüntü çözünürlüğünün tam ortasına (örneğin 1920x1080 bir görüntü için yaklaşık \(c_x=960, c_y=540\)) yakın bir değerdir.
         self.K = np.array([
             [fx,  0.0, cx],
             [0.0, fy,  cy],
@@ -121,7 +128,7 @@ class CameraCalibration:
         self.dist_coeffs = np.array(dist, dtype=np.float64)
 
         # K'nın inverse'i — back-projection için (semantic_scale.py kullanacak)
-        self.K_inv = np.linalg.inv(self.K)
+        self.K_inv = np.linalg.inv(self.K) #?
 
         # Scalar değerler — diğer modüllerin doğrudan erişimi için
         self.fx = fx
@@ -163,10 +170,14 @@ class CameraCalibration:
             size=(width, height),
             m1type=cv2.CV_32FC1,
         )
+
+        print(f"\n map1 : {map1}, map2 : {map2} \n")
+
         logger.debug(
             "[CameraCalibration] Undistort map'leri hesaplandı: %dx%d", width, height
         )
         return map1, map2
+
 
     # ------------------------------------------------------------------
     # Public API
@@ -195,6 +206,7 @@ class CameraCalibration:
                 f"Beklenen: {self.image_width}x{self.image_height}, "
                 f"Alınan: {w}x{h}"
             )
+        print(f"\n undistort map1 : {self._undistort_map1}, map2 : {self._undistort_map2} \n")
 
         return cv2.remap(
             frame,
@@ -224,6 +236,9 @@ class CameraCalibration:
 
         u = self.fx * (X / Z) + self.cx
         v = self.fy * (Y / Z) + self.cy
+
+        print(f"\n project_point : u={u}, v={v} \n")
+
         return np.array([u, v], dtype=np.float64)
 
     def backproject_point(self, pixel: np.ndarray, depth: float) -> np.ndarray:
@@ -243,6 +258,8 @@ class CameraCalibration:
         u, v = pixel
         p_hom = np.array([u, v, 1.0], dtype=np.float64)
         p_cam = depth * (self.K_inv @ p_hom)
+
+        print(f"\n backproject_point : X={p_cam[0]}, Y={p_cam[1]}, Z={p_cam[2]} \n")
         return p_cam
 
     def summary(self) -> str:
@@ -282,27 +299,27 @@ if __name__ == "__main__":
         loader = DataLoader(str(config_path))
         cam = CameraCalibration(loader)
 
-        print(cam.summary())
+        print("\n summary:",cam.summary())
 
         # Undistort testi — ilk frame
         first_frame_path = loader.frame_list[0]
         raw_frame = loader.load_frame(first_frame_path)
         undistorted = cam.undistort(raw_frame)
-        print(f"Undistort testi: {first_frame_path.name}")
-        print(f"  Input shape : {raw_frame.shape}")
-        print(f"  Output shape: {undistorted.shape}")
+        print(f"\n Undistort testi: {first_frame_path.name}")
+        print(f" \n  Input shape : {raw_frame.shape}")
+        print(f" \n Output shape: {undistorted.shape}")
 
         # Back-projection testi
         pixel = np.array([cam.cx, cam.cy])  # görüntü merkezi
         depth = 50.0                         # 50 metre
         p_cam = cam.backproject_point(pixel, depth)
         print(f"\nBack-projection testi:")
-        print(f"  Piksel: {pixel} → 3D: {p_cam}")
+        print(f" \n Piksel: {pixel} → 3D: {p_cam}")
 
         # Projeksiyon testi — back-projection'ın tersini al
         p_proj = cam.project_point(p_cam)
-        print(f"  3D: {p_cam} → Piksel: {p_proj}")
-        print(f"  Round-trip hata: {np.linalg.norm(pixel - p_proj):.6f} piksel")
+        print(f" \n  3D: {p_cam} → Piksel: {p_proj}")
+        print(f" \n  Round-trip hata: {np.linalg.norm(pixel - p_proj):.6f} piksel")
 
     except (DataLoaderError, CameraCalibrationError) as e:
         logger.error("Hata: %s", e)

@@ -10,7 +10,7 @@ Deployment model
 ----------------
 In a real mission the module engages when GNSS is lost, not at take-off.
 At that moment the aircraft still has:
-    - last GNSS fix        -> starting position
+    - last GNSS fix           -> starting position
     - barometer / rangefinder -> altitude, unaffected by the outage
     - IMU, magnetometer
 
@@ -19,15 +19,15 @@ So the warmup phase does not have to sit at the start of the flight.
 
 During the warmup window the reference signal (ground truth here, GNSS in
 deployment) is used to learn two things:
-    s_ref     : metric displacement per frame
-    k         : depth-to-scale coefficient, k = s_ref / Z
+    s_ref  : metric displacement per frame
+    k      : depth-to-scale coefficient, k = s_ref / Z
 
 After the window closes the reference is never read again.
 
 Altitude sources
 ----------------
     semantic : Z estimated from YOLO bounding boxes
-    gt       : Z read from ground truth (barometer equivalent)
+    gt       : Z read from the reference channel (barometer equivalent)
     hybrid   : gt when available, semantic otherwise
 
 Depth from bounding box (pinhole model, nadir view):
@@ -63,14 +63,14 @@ class ScaleRecoveryError(Exception):
 @dataclass
 class DepthEstimate:
     """Single altitude measurement from one bounding box."""
-    depth: float
-    depth_raw: float
+    depth: float          # corrected altitude estimate, metres
+    depth_raw: float      # before cos^2 correction
     class_id: int
     confidence: float
-    quality: float
-    radial_px: float
-    cos2: float
-    d_pixel: float
+    quality: float        # selection score
+    radial_px: float      # distance from principal point
+    cos2: float           # applied correction factor
+    d_pixel: float        # dominant bbox edge used
 
     def __repr__(self) -> str:
         return (f"DepthEstimate(Z={self.depth:.2f}m, raw={self.depth_raw:.2f}m, "
@@ -100,9 +100,9 @@ class ScaleRecovery:
     Recovers metric scale for monocular visual odometry.
 
     Timeline:
-        frame < warmup_start                    -> pre-warmup, fixed unit scale
-        warmup_start <= frame < warmup_end      -> learning from reference
-        frame >= warmup_end                     -> autonomous
+        frame < warmup_start                -> pre-warmup, unit scale
+        warmup_start <= frame < warmup_end  -> learning from reference
+        frame >= warmup_end                 -> autonomous
     """
 
     _MIN_DEPTH = 1.0
@@ -123,11 +123,8 @@ class ScaleRecovery:
         self._loader = data_loader
         self._cam = camera_calibration
 
-
         eval_cfg = data_loader.get_evaluation_config()
         sem_cfg = data_loader.get_semantic_config()
-
-        
 
         self._warmup_start = int(eval_cfg.get("warmup_start", 0))
         self._warmup_len = int(eval_cfg.get("warmup_frames", 150))
@@ -136,8 +133,13 @@ class ScaleRecovery:
         self._altitude_source = str(eval_cfg.get("altitude_source", "semantic")).lower()
         if self._altitude_source not in ("semantic", "gt", "hybrid"):
             raise ScaleRecoveryError(
-                f"altitude_source must be semantic/gt/hybrid, got '{self._altitude_source}'"
+                f"altitude_source must be semantic/gt/hybrid, "
+                f"got '{self._altitude_source}'"
             )
+
+        # This dataset uses a NED-style convention: Z grows downward and is
+        # measured relative to the launch point. A barometer reports absolute
+        # altitude directly, so this conversion is dataset-specific.
         self._gt_z_down = bool(eval_cfg.get("gt_z_is_down", False))
         self._gt_z_offset = float(eval_cfg.get("gt_z_offset", 0.0))
 
@@ -167,9 +169,10 @@ class ScaleRecovery:
 
         logger.info(
             "[ScaleRecovery] Ready -- warmup [%d, %d), altitude_source=%s, "
-            "cos2=%s, dominant_edge=%s",
+            "cos2=%s, dominant_edge=%s, z_down=%s, z_offset=%.2f",
             self._warmup_start, self._warmup_end, self._altitude_source,
             self._use_cos2, self._use_dominant_edge,
+            self._gt_z_down, self._gt_z_offset,
         )
 
     # ------------------------------------------------------------------
@@ -198,6 +201,10 @@ class ScaleRecovery:
         w = abs(x2 - x1)
         h = abs(y2 - y1)
 
+        # Dominant edge instead of height. In nadir view a vehicle's bbox
+        # height equals its length only when the vehicle is aligned with the
+        # image vertical axis; the dominant edge tracks the reference
+        # dimension regardless of heading.
         d_pixel = float(max(w, h)) if self._use_dominant_edge else float(h)
 
         u_c = (x1 + x2) / 2.0
@@ -213,6 +220,13 @@ class ScaleRecovery:
         return d_pixel, radial_px, cos2
 
     def _depth_from_detection(self, det: Detection) -> Optional[DepthEstimate]:
+        """
+        Altitude estimate from a single detection.
+
+            A = (f_y * H_real * cos^2(theta)) / d_pixel
+
+        Returns None when the detection fails any plausibility check.
+        """
         if det.class_id not in self._reference_objects:
             return None
         if det.confidence < self._min_confidence:
@@ -250,28 +264,45 @@ class ScaleRecovery:
 
     def _semantic_depth(self, frame_name: str) -> Optional[DepthEstimate]:
         """
-        Altitude above ground from the reference channel.
+        Altitude estimated from YOLO bounding boxes.
 
-        The dataset uses a NED-style convention: Z grows downward and is
-        measured relative to the launch point. Absolute altitude is
+        Picks the best reference detection in the frame. Candidates are
+        scored by
 
-            Z_agl = z_offset - z_gt          (down-positive)
-            Z_agl = z_offset + z_gt          (up-positive)
+            quality = confidence * cos^2(theta)
 
-        In deployment a barometer reports absolute altitude directly and
-        this conversion is not needed.
+        Confidence alone is the wrong criterion -- it measures classification
+        certainty, not localisation quality. A detector can be 95 percent
+        sure an object is a car while placing the box ten pixels off. The
+        cos^2 term penalises objects near the image border, where bbox
+        regression is least reliable and the geometric correction largest.
+
+        When three or more strong candidates exist their median depth is
+        used, so a single mis-regressed box cannot drag the estimate.
         """
-        gt = self._loader.get_ground_truth(frame_name)
-        if gt is None:
+        detections = self._loader.get_detections(frame_name)
+        if not detections:
             return None
 
-        z_rel = float(gt.tz)
-        z = (self._gt_z_offset - z_rel) if self._gt_z_down \
-            else (self._gt_z_offset + z_rel)
-
-        if not (self._MIN_DEPTH <= z <= self._MAX_DEPTH):
+        cands = [e for e in (self._depth_from_detection(d) for d in detections)
+                 if e is not None]
+        if not cands:
             return None
-        return z
+
+        cands.sort(key=lambda e: e.quality, reverse=True)
+        best = cands[0]
+
+        # Median of the strong candidates. Two candidates would make the
+        # median equal the mean, so the guard starts at three.
+        strong = [c for c in cands if c.quality >= 0.8 * best.quality]
+        if len(strong) >= 3:
+            best = DepthEstimate(
+                depth=float(np.median([c.depth for c in strong])),
+                depth_raw=best.depth_raw, class_id=best.class_id,
+                confidence=best.confidence, quality=best.quality,
+                radial_px=best.radial_px, cos2=best.cos2, d_pixel=best.d_pixel,
+            )
+        return best
 
     # ------------------------------------------------------------------
     # altitude
@@ -343,7 +374,8 @@ class ScaleRecovery:
             s = ||delta_ref|| / ||t||
 
         t is a unit vector, so the full 3D norm is used -- projecting onto
-        XY would discard the vertical component that the reference provides.
+        XY would discard the vertical component the reference provides, and
+        would also inflate the scale because ||t_xy|| < 1 whenever t_z != 0.
         """
         gt_curr = self._loader.get_ground_truth(frame_name)
         gt_prev = self._loader.get_ground_truth(pose.frame_name_prev)
@@ -366,7 +398,18 @@ class ScaleRecovery:
         return scale
 
     def _finalize(self) -> None:
-        """Closes the warmup window and fixes the calibrated constants."""
+        """
+        Closes the warmup window and fixes the calibrated constants.
+
+            k = median(s_ref_i / Z_i)
+
+        Physical reading: at a fixed angular rate the metric displacement
+        per frame is proportional to altitude. A drone at twice the height
+        covers twice the ground for the same image motion. The coefficient
+        k absorbs focal length, frame interval and typical angular rate.
+
+        Sanity check: k * Z should reproduce the warmup scale.
+        """
         self._calibrated = True
 
         if self._scale_history:
@@ -378,7 +421,8 @@ class ScaleRecovery:
         if len(self._k_history) >= self._MIN_K_SAMPLES:
             self._k_factor = float(np.median(self._k_history))
             logger.info(
-                "[ScaleRecovery] Warmup closed -- scale=%.5f (%d), k=%.6f (%d, std=%.6f)",
+                "[ScaleRecovery] Warmup closed -- scale=%.5f (%d), "
+                "k=%.6f (%d, std=%.6f)",
                 self._warmup_scale_mean, len(self._scale_history),
                 self._k_factor, len(self._k_history), float(np.std(self._k_history)),
             )
@@ -399,7 +443,7 @@ class ScaleRecovery:
                 float(np.median(ratio)), float(np.mean(ratio)),
                 float(np.std(ratio)), len(a),
             )
-
+ 
     # ------------------------------------------------------------------
     # autonomous
     # ------------------------------------------------------------------
@@ -407,10 +451,17 @@ class ScaleRecovery:
     def _autonomous(
         self, frame_name: str,
     ) -> Tuple[Optional[float], Optional[float], Optional[int], str]:
+        """
+        Scale from calibrated altitude:  s = k * Z
+
+        Rejected when the result falls outside a plausibility band around
+        the warmup median, so a single bad measurement cannot corrupt the
+        trajectory.
+        """
         z, cls, src = self._altitude(frame_name)
         if z is None:
             return None, None, None, src
-
+        
         z = self._smoothed(z)
 
         if self._k_factor is None:
@@ -422,7 +473,8 @@ class ScaleRecovery:
         lo, hi = self._SCALE_LOWER_MULT * base, self._SCALE_UPPER_MULT * base
         if not (lo <= scale <= hi):
             logger.debug(
-                "[ScaleRecovery] Scale %.5f outside [%.5f, %.5f], falling back. Z=%.2f",
+                "[ScaleRecovery] Scale %.5f outside [%.5f, %.5f], "
+                "falling back. Z=%.2f",
                 scale, lo, hi, z,
             )
             return None, z, cls, src
@@ -464,7 +516,9 @@ class ScaleRecovery:
             if s_ref is not None and z is not None and z > 1e-9:
                 self._k_history.append(s_ref / z)
 
-            # diagnostic: how well does bbox depth track reference altitude
+            # Diagnostic: how well does bbox depth track reference altitude.
+            # This is what caught the NED sign error -- the ratio came out
+            # at 134 instead of 1.0.
             if self._altitude_source != "gt":
                 est = self._semantic_depth(frame_name)
                 z_ref = self._gt_altitude(frame_name)
@@ -568,8 +622,20 @@ if __name__ == "__main__":
         sr = ScaleRecovery(loader, cam)
 
         print(f"\n{sr}\n")
+
+        # quick sanity: both altitude sources on the same frames
+        print("--- altitude sources ---")
+        for nm in loader.frame_list[:5]:
+            est = sr._semantic_depth(nm.name)
+            gz = sr._gt_altitude(nm.name)
+            if est is None:
+                print(f"  {nm.name:24s} semantic=None      gt={gz}")
+            else:
+                print(f"  {nm.name:24s} semantic={est.depth:6.2f} "
+                      f"(cls={est.class_id}, q={est.quality:.3f})   gt={gz}")
+
         LIMIT = 900
-        print(f"--- Scale Recovery Test ({LIMIT} frames) ---")
+        print(f"\n--- Scale Recovery Test ({LIMIT} frames) ---")
 
         prev = None
         results = []
