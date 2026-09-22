@@ -564,14 +564,17 @@ class MotionEstimator:
             pose.t = t
             pose.inlier_mask = selected_mask
             pose.inlier_count = int(np.sum(selected_mask))
-            pose.is_valid = True
 
             if pose.inlier_count < self._min_inlier_count:
                 logger.warning(
-                    "[MotionEstimator] Low inlier count: %d < %d.",
+                    "[MotionEstimator] Low inlier count: %d < %d -- rejecting pose.",
                     pose.inlier_count,
                     self._min_inlier_count,
                 )
+                pose.is_valid = False
+                return pose
+
+            pose.is_valid = True
 
             logger.debug("[MotionEstimator] %s", pose)
             return pose
