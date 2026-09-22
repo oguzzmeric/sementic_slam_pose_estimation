@@ -59,6 +59,7 @@ scale_rec = ScaleRecovery(loader, cam)
 pose_graph = PoseGraph(loader)
 
 K = cam.K
+F_FOCAL = float(np.sqrt(cam.fx * cam.fy))  # regularizasyon icin aci->piksel cevrimi
 
 # --------------------------------------------------------------------
 # 1) uretim pipeline'ini bir kere calistir, her adimi kaydet
@@ -200,7 +201,7 @@ def parallax_ok(track, R_first, t_first, R_last, t_last):
     return cos_parallax <= PARALLAX_COS_THRESHOLD
 
 
-def window_residuals(params, R_local_win, t_dir_win, t_mag_win, R0, t0, tracks):
+def window_residuals(params, R_local_win, t_dir_win, t_mag_win, R0, t0, tracks, n_inliers_win):
     """
     params       : (6*(W-1),) her lokal adim icin [delta_R (3), delta_t_dir (3)]
     R_local_win  : pencere icindeki W-1 orijinal lokal rotasyon
@@ -211,6 +212,9 @@ def window_residuals(params, R_local_win, t_dir_win, t_mag_win, R0, t0, tracks):
                    onceki pencerenin DUZELTILMIS sonucu)
     tracks       : her biri (n+1, 2) -- pencerenin TUM karelerinde gorulen
                    ayni fiziksel noktanin piksel gozlemleri
+    n_inliers_win: pencere icindeki W-1 adimin ORIJINAL inlier sayisi --
+                   regularizasyon agirligini buradan turetiyoruz (sihirli
+                   sayi degil, olcumun kendi guveni)
     """
     n = len(R_local_win)
     params = params.reshape(n, 6)
@@ -246,6 +250,16 @@ def window_residuals(params, R_local_win, t_dir_win, t_mag_win, R0, t0, tracks):
                 continue
             residuals.append(proj[0] / proj[2] - pt[0])
             residuals.append(proj[1] / proj[2] - pt[1])
+
+    # --- prensipli regularizasyon: kucuk aci/yon degisimini piksel
+    # esdegerine cevir (f * aci), agirlik = sqrt(N) -- N buyudukce
+    # standart hata 1/sqrt(N) kucultur, yani daha fazla inlier'la
+    # desteklenen bir tahmin degistirmeye daha dirençli olur. Sabit
+    # bir "lambda" yok -- her adimin kendi olcum guveninden geliyor.
+    for i in range(n):
+        w = F_FOCAL * np.sqrt(max(n_inliers_win[i], 1))
+        residuals.extend((delta_R[i] * w).tolist())
+        residuals.extend((delta_t[i] * w).tolist())
 
     if not residuals:
         return np.zeros(6 * n)  # params'i degistirmeye gerek yok
@@ -302,11 +316,12 @@ for start in range(0, N, WINDOW - 1):
     R_local_win = R_local_all[start:end]
     t_mag_win = [float(np.linalg.norm(t)) for t in t_local_all[start:end]]
     t_dir_win = [t_local_all[start + i] / max(t_mag_win[i], 1e-12) for i in range(n)]
+    n_inliers_win = [len(steps[start + i]["pts_prev"]) for i in range(n)]
 
     x0 = np.zeros(6 * n)
     result = least_squares(
         window_residuals, x0, method="trf", loss="huber", f_scale=REPROJ_F_SCALE,
-        args=(R_local_win, t_dir_win, t_mag_win, R0, t0, tracks),
+        args=(R_local_win, t_dir_win, t_mag_win, R0, t0, tracks, n_inliers_win),
         max_nfev=300,
     )
 

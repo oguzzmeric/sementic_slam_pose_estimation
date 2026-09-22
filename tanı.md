@@ -486,30 +486,68 @@ C) `k`'yi tek sabit yerine irtifa ve/veya hız bin'lerine göre öğrenmek
    (warmup verisiyle). Daha fazla veri/karmaşıklık ister, henüz
    tasarlanmadı.
 
-### 3. Bundle adjustment (motion-only, pencereli) — ŞU AN ÇALIŞILAN
+### 3. Bundle adjustment (motion-only, pencereli) — scipy'de 4 tur denendi, hiçbiri üretimi geçemedi
 
 Yön gürültüsü için. BA ölçeği düzeltmez (Görev 2 zaten flow-scale ile
 kısmen ele alındı).
 
-**Araç kararı (22 Eylül):** GTSAM tercih edildi (scipy değil) — bu proje
-kullanıcının mezuniyet sonrası şirketlere göstereceği bir portfolyo
-projesi, endüstri standardı bir SLAM backend'i kullanmak sonuç kalitesinden
-bağımsız bir sinyal değeri taşıyor.
+**Araç kararı (22 Eylül):** Önce GTSAM düşünüldü (bu proje kullanıcının
+mezuniyet sonrası şirketlere göstereceği bir portfolyo projesi, endüstri
+standardı bir SLAM backend'i kullanmak sonuç kalitesinden bağımsız bir
+sinyal değeri taşıyor) ama GTSAM'in PyPI'da HİÇBİR sürümde (4.0.2 → 4.3.0)
+Windows wheel'i olmadığı doğrulandı (sadece `macosx_*`/`manylinux*`).
+Karar: önce ucuz olan scipy'de konsepti doğrula (aynı formülasyon
+hatasını GTSAM'e taşımamak için — tool switch + formulation fix'i AYNI
+ANDA yapmamak, kural #2), sonuç netleşince GTSAM/WSL'e geç.
 
-**Engel:** GTSAM'in PyPI'da HİÇBİR sürümde (4.0.2 → 4.3.0) Windows wheel'i
-yok — sadece `macosx_*` ve `manylinux*` (Linux) dosyaları var. Python
-sürümü değiştirmek (3.10/3.11/3.13) sonucu değiştirmez, bu platform
-kısıtı. Kaynak koddan Windows'ta derlemek (Boost, CMake, MSVC) pratik değil.
+**`bacheck.py` — 4 varyant, hepsi diagnostic, core/*.py'ye entegre
+edilmedi:**
 
-**Karar:** Kullanıcının Linux makinesine geçilip oradan devam edilecek
-(manylinux wheel `pip install gtsam` ile çalışır). Windows tarafında kod
-git'e push edildi, bu dosya güncellendi — Linux'ta `git pull` + yeni venv
-(`python -m venv venv && pip install -r requirements.txt`) ile devam
-edilebilir. VS Code zaten Linux'ta kurulu; sadece proje klasörünü açıp
-(gerekirse Claude Code CLI/extension kurup) devam edilebilir, VS Code'un
-kendisi yeniden kurulmaz.
+```
+                                    URETIM      v1        v2        v3        v4
+Sim(3) ATE                          24.14 m     67.72 m   65.60 m   60.69 m   52.96 m
+HIZALANMAMIS mean (bu diagnostic'in
+  kendi kaba hizalamasiyla)        136.84 m       --      105.78 m  199.54 m  83.78 m
+```
 
-**Henüz yazılmadı** — bu, bir sonraki oturumun ilk işi.
+- **v1 (naif):** sadece ardışık çift eşleşmeleri, gerçek çoklu-kare track
+  yok — her pencere içi düzeltme aslında `cv2.recoverPose`'un zaten
+  çözdüğü şeyi daha gürültülü bir yoldan tekrar çözüyordu.
+- **v2:** gerçek çok-kareli track (aynı fiziksel nokta pencere boyunca
+  zincirleniyor, `frame_010→011` ve `frame_011→012` eşleşmelerinin AYNI
+  frame_011 keypoint'ini paylaştığı doğrulanarak) + düşük-paralaks gate
+  eklendi (83/90 pencere kullanılabildi, pencere başı ort. 44 track) —
+  yine de kötü.
+- **v3:** sadece rotasyon değil, öteleme YÖNÜ de (uzunluk sabit, zaten
+  kalibre) birlikte optimize edildi — küçük bir iyileşme (65.6→60.7m)
+  ama hâlâ 2.5x kötü.
+- **v4:** "prensipli" regularizasyon eklendi — `residual = f * delta *
+  sqrt(N_inlier)`, yani her adımın kendi orijinal inlier sayısından gelen
+  güvenle orantılı bir "orijinal tahminden çok uzaklaşma" cezası (sabit,
+  datasete-özel bir `lambda` DEĞİL). En iyi sonuç (52.96m) ama hâlâ 2.2x
+  kötü. **Bilinen sorun:** regularizasyon residual'lerinin mutlak
+  büyüklüğü (`f≈2680 × √N≈7 ≈ 18800` çarpanı) reprojection residual'lerinin
+  (birkaç piksel) ölçeğinden çok büyük çıkıyor, ve ikisi aynı huber
+  `f_scale`'i paylaşıyor — yani ölçeklendirme hâlâ kabaca ayarlı,
+  "prensipli" türetim doğru ama mutlak birim kalibrasyonu eksik.
+
+**Tutarlı bir trend var** (her düzeltme sonucu bir öncekinden iyileştirdi:
+67.7→65.6→60.7→53.0m) ama 4 turda da üretim ATE'sini (24.1m) geçemedik.
+Bu, "windowed motion-only BA fikri tamamen yanlış" değil, "bu 6-kareli
+pencere + sınırlı paralaks + kaba ölçeklendirmeyle yeterince iyi
+çözülmüyor" sinyali.
+
+**Karar (kullanıcı, 22 Eylül):** Burada durup WSL üzerinden GTSAM'e
+geçiliyor. Gerekçe: gürültü-modeli/regularizasyon ölçeklendirmesini
+GTSAM doğal olarak (factor noise model'leriyle) doğru yapıyor, scipy'de
+elle kalibre etmeye çalışmak zaman kaybı olmaya başladı. `core/*.py`'ye
+hiçbir BA kodu entegre edilmedi — üretim hâlâ Umeyama Sim3 + flow-scale
+durumunda (bkz. "Mevcut durum").
+
+**Sıradaki iş:** WSL kurulumu (`wsl --install`), Linux tarafında yeni
+venv + `pip install gtsam` + `pip install -r requirements.txt`, sonra
+GTSAM ile aynı formülasyonu (çok-kareli track + düşük-paralaks gate +
+gürültü-modelli motion-only BA) yeniden yazıp ölç.
 
 ## Oturum notu (22 Eylül) — ctrl+S/overwrite ile kayıp ve kurtarma
 
