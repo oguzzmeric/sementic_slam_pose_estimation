@@ -58,11 +58,5 @@ def debug_window(start, end):
         gray_prev = gray_curr
 
 
-print("=== IYI pencere (referans) ===")
-debug_window(0, 14)
-print()
-print("=== COKEN pencere ===")
-debug_window(238, 252)
-print()
-print("=== COKEN pencere 2 ===")
-debug_window(280, 294)
+print("=== pencere [7:31] -- longtrack_gtsam.py'de hep 4'te kesilen bolge ===")
+debug_window(7, 31)

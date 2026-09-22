@@ -679,21 +679,53 @@ satırında kaldırılan bir sabite (`LONG_WINDOW`) referans kalmış, script
 en sonda çöküyordu — bu düzeltildi (kozmetik), ama pencere-uzunluğu
 bug'ı **çözülmedi**.
 
-**Yarın ilk iş:** `longtrack_gtsam.py`'deki `build_long_tracks`
-fonksiyonunun durdurma mantığını (`med_disp`/`n_alive` hesaplarını,
-`klt_debug.py` ile birebir karşılaştırarak) debug etmek — neden ikinci
-pencereden itibaren hep tam `MIN_WINDOW` uzunluğunda kesildiğini bulup
-düzeltmek, sonra ölçmek. `git status` ile dosyaların gerçekten ne
-içerdiğini kontrol etmeden devam etme (bkz. aşağıdaki ctrl+S dersi).
+**Bug bulundu ve çözüldü (aynı oturum, devam edildi):** `build_long_tracks`
+her pencerede aynı yerde (tam `MIN_WINDOW`) kesiliyordu çünkü durdurma
+eşiği (`DISPLACEMENT_STOP_PX`) **kümülatif** (pencere başından toplam)
+kayma sanılarak konmuştu, ama gerçekte `klt_debug.py`'nin ölçtüğü şey
+her hop'un **kendi** (o adıma özel) kaymasıydı — iki farklı büyüklük.
+Kümülatif kayma çok daha hızlı büyüdüğü için eşik (85px) hep 3.
+hopta aşılıyordu. Düzeltme: `hop_disp` artık gerçekten her-hop'un-
+kendi-kayması (`pts_curr - tracks`, `tracks = pts_curr`'dan ÖNCE
+hesaplanıyor, `klt_debug.py` ile birebir aynı tanım).
 
-**Bundan sonrası için adaylar (öncelik kullanıcıyla konuşulacak):**
-(a) uzun-bazlı KLT track'i düzgün çalışır hale getirip (bug'ı çöz)
-ölçmeye devam etmek — şu ana kadarki TEK pozitif sinyal bu yönden
-geldi, (b) bağımsız bir dış referans (IMU yok ama periyodik GNSS
+**Düzeltme sonrası ölçüm — uyarlanabilir pencere, iki eşik denendi,
+İKİSİ DE sabit 15 kareden kötü çıktı:**
+
+```
+                          uretim      sabit-15     130px esik   200px esik
+Sim(3) ATE                22.54 m     21.35-21.74m  22.17 m      22.43 m
+HIZALANMAMIS mean        147.94 m     143.53-143.96m 159.97 m     165.07 m
+```
+
+Eşiği gevşetince (130→200px) medyan pencere uzunluğu hâlâ 4 kaldı —
+demek ki asıl kısıtlayan şey hareket eşiği değil, `MIN_ALIVE_TRACKS`
+(hayatta kalan track sayısı) çıktı; yanlış kolu ayarlıyorduk. Üçüncü
+bir eşik denemek "sonuç iyi çıkana kadar ayarlama" riskine giriyordu,
+o yüzden **durduk ve sabit 15 kareye geri dönüldü** (`MIN_WINDOW=
+MAX_WINDOW=15`, adaptif eşikler etkisiz bırakıldı). Bu, tüm oturumun
+en iyi, en temiz sonucu olarak kalıyor: **Sim(3) ATE %5.3, hizalanmamış
+mean %2.7 iyileşme.**
+
+**`YONTEMLER_OZETI.txt`** (repo kökünde) — bu araştırmada denenen 13
+yöntemin (4 başarılı/kalıcı, 9 başarısız/reddedilen) hepsinin ne
+yaptığı, nasıl çalıştığı (somut örneklerle) ve sonucu tek dosyada.
+Ayrıca "sonraki adımlar" sentezi ve 7 okuma kaynağı (Hartley&Zisserman,
+Nistér, ORB-SLAM2, VINS-Mono, KLT orijinal makale, GTSAM/factor graph
+teorisi, ATE/Sim3 değerlendirme metodolojisi) içeriyor.
+
+**Bundan sonrası için adaylar (öncelik kullanıcıyla konuşulacak,
+1.5 aylık süre var, acele yok):**
+(a) KLT'yi olgunlaştırmak — pencere ortasında yeni köşe ekleme
+(besleme), hızlı hareket segmentlerinde `frame_step`'i dinamik
+düşürmek. Şu ana kadarki TEK pozitif sinyal bu yönden geldi, en olgun
+aday.
+(b) bağımsız bir dış referans (IMU yok ama periyodik GNSS
 yeniden-yakalama zaten "Faz B" olarak planlıydı) ile sistematik hatayı
-gerçekten düzeltmek, (c) burada durup dürüstçe belgeleyip projenin
-sunum/temizlik tarafına geçmek — ama artık 1.5 aylık süre olduğu için
-(c) aceleye getirilmeyecek.
+gerçekten düzeltmek.
+(c) kalıcı harita + gerçek keyframe tabanlı BA (büyük yatırım).
+(d) burada durup dürüstçe belgeleyip projenin sunum/temizlik tarafına
+geçmek — her zaman elde bir "yeterince iyi" durak noktası.
 
 ## Oturum notu (22 Eylül) — ctrl+S/overwrite ile kayıp ve kurtarma
 

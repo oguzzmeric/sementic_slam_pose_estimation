@@ -37,10 +37,10 @@ from core.motion_estimator import MotionEstimator
 from core.scale_recovery import ScaleRecovery
 from core.pose_graph import PoseGraph
 
-MIN_WINDOW = 4      # en az bu kadar kare olmadan BA'ya girme
-MAX_WINDOW = 25     # sakin bolgelerde pencere en fazla bu kadar buyusun
-DISPLACEMENT_STOP_PX = 85.0  # kumulatif medyan kayma bunu gecince pencereyi kapat
-MIN_ALIVE_TRACKS = 15        # hayatta kalan track bunun altina dusunce kapat
+MIN_WINDOW = 15     # SABIT 15 kare -- adaptif esik denemeleri (130/200px) ikisi de
+MAX_WINDOW = 15     # bundan daha kotu cikti, en iyi olculen sonuc bu sabit deger.
+DISPLACEMENT_STOP_PX = 1e9   # etkisiz birakildi
+MIN_ALIVE_TRACKS = 0         # etkisiz birakildi
 MAX_TRACKS_PER_WINDOW = 150
 PARALLAX_COS_THRESHOLD = 0.99998
 PIXEL_NOISE_SIGMA = 1.5
@@ -128,7 +128,6 @@ def build_long_tracks(frame_paths, frame_names):
     tracks = pts0.reshape(-1, 1, 2)
     alive = np.ones(len(tracks), dtype=bool)
     history = [tracks[:, 0, :].copy()]
-    start_pos = tracks[:, 0, :].copy()
 
     gray_prev = gray0
     used = 0
@@ -142,8 +141,13 @@ def build_long_tracks(frame_paths, frame_names):
 
         fb_err = np.linalg.norm((tracks - pts_back).reshape(-1, 2), axis=1)
         ok = (st_fwd.flatten() == 1) & (st_bwd.flatten() == 1) & (fb_err < KLT_FB_THRESHOLD)
-        alive &= ok
 
+        # bu HOP'UN KENDI kaymasi (onceki kareden bu kareye) -- kumulatif degil.
+        # tracking kalitesi kumulatif mesafeye degil, HER ADIMDAKI goruntu
+        # kaymasinin buyuklugune bagli, o yuzden esik burada uygulanir.
+        hop_disp = np.linalg.norm((pts_curr - tracks).reshape(-1, 2), axis=1)
+
+        alive &= ok
         history.append(pts_curr[:, 0, :].copy())
         tracks = pts_curr
         gray_prev = gray_curr
@@ -153,9 +157,8 @@ def build_long_tracks(frame_paths, frame_names):
         if n_alive < MIN_ALIVE_TRACKS and i >= MIN_WINDOW - 1:
             break
 
-        cum_disp = np.linalg.norm((pts_curr[:, 0, :] - start_pos)[alive], axis=1)
-        med_disp = float(np.median(cum_disp)) if len(cum_disp) else 1e9
-        if med_disp > DISPLACEMENT_STOP_PX and i >= MIN_WINDOW - 1:
+        med_hop_disp = float(np.median(hop_disp))  # klt_debug.py ile ayni -- TUM noktalar, sadece hayatta kalanlar degil
+        if med_hop_disp > DISPLACEMENT_STOP_PX and i >= MIN_WINDOW - 1:
             break
 
     n_frames_used = used + 1  # ilk kare + used hop

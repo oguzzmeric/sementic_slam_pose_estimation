@@ -1,0 +1,342 @@
+===================================================================
+YÖNTEMLER ÖZETİ — Monoküler VO'da Yön (Heading) Hatası Araştırması
+Tarih: 21-23 Eylül 2026
+===================================================================
+
+BU DOSYA NE İÇİN
+-------------------------------------------------------------------
+Şu ana kadar bu projede denenen HER yöntemi, sırayla, "ne yaptık -
+nasıl çalışıyor (hayal edilebilir açıklama) - sonuç - karar" formatında
+listeler. Amaç: yarın/gelecekte bu araştırmaya dönen biri (sen ya da
+başka biri), tekerleği yeniden icat etmeden tam olarak nerede
+durduğumuzu görsün.
+
+Sistemin genel çalışma prensibi (bu, tüm yöntemlerin ortak zemini):
+Drone'un tek bir kamerası var. Ardışık iki fotoğraf arasında, aynı
+fiziksel noktaların (köşe, kenar) hangi pikselden hangi piksele
+kaydığına bakarak "kamera nasıl hareket etti" (döndü + ötelendi)
+sorusunu çözüyoruz -- buna "visual odometry" (VO) deniyor. Tek kamerayla
+bu hareketin YÖNÜ bulunabilir ama BÜYÜKLÜĞÜ (ölçek) bulunamaz -- bunun
+için ayrı bir referans (bilinen boyutlu araç ya da kısa bir GNSS
+penceresi) kullanıyoruz. Bulunan her adım, öncekinin üzerine eklenerek
+(zincirleme) tüm uçuş yolu (trajectory) inşa ediliyor.
+
+PROBLEM: bu zincirleme sırasında küçük yön hataları birikip ~20-27
+derecelik sistematik bir sapmaya dönüşüyor. Bu dosyadaki her yöntem,
+bu sapmayı azaltmaya çalışıyor.
+
+===================================================================
+BAŞARILI OLAN YÖNTEMLER (üretime girdi, kalıcı)
+===================================================================
+
+1. DLT TRIANGULATION DÜZELTMESİ (core/motion_estimator.py)
+-------------------------------------------------------------------
+NE: Essential/Homography matrisinden çıkan 4 aday (R,t) arasından
+    doğrusunu seçmek için, her adayla noktaları 3B'ye "triangulate"
+    edip (üçgenleme) kameraların önünde mi arkasında mı düştüğüne
+    bakıyoruz (cheirality testi). Bu üçgenleme matematiği, noktaları
+    ve kamera matrislerini AYNI koordinat sisteminde (normalize ya da
+    piksel, ikisinden biri) tutmalı. Kod, noktaları normalize etmiş
+    ama kamera matrislerine hâlâ K (kalibrasyon) uygulanmış haldeydi
+    -- iki farklı cetvelle ölçüp karşılaştırmak gibi bir hataydı.
+HAYAL ET: İki farklı birim sistemiyle (biri metre biri santimetre)
+    bir mesafeyi karşılaştırıp "hangisi daha yakın" demeye çalışmak --
+    cevap rastgele çıkar.
+SONUÇ: H (homography) seçilen kare sayısı 0'dan 54'e çıktı -- düzeltme
+    öncesi H hiç işe yaramıyordu.
+DURUM: KALICI, üretimde.
+
+2. UMEYAMA SIM(3) RELOCALIZATION (core/pose_graph.py)
+-------------------------------------------------------------------
+NE: Kameranın hareketini takip ettiğimiz "lokal" koordinat çerçevesi,
+    gerçek dünya (GT) çerçevesiyle aynı yönde/ölçekte değil -- ilk
+    kameranın rastgele bir açısından başlıyor. Eskiden bunu elle
+    tahmin edilmiş sabit bayraklarla (swap_xy, flip_y -- 90 derecenin
+    katları) düzeltmeye çalışıyorduk. Yeni yöntem: GT bilinen warmup
+    fazında (lokal_pozisyon, GT_pozisyon) çiftlerini biriktirip, bu
+    çiftlere en iyi uyan TEK bir dönüşüm (ölçek+dönüş+öteleme --
+    "Sim(3)") matematiksel olarak (SVD ile) çözüyoruz.
+HAYAL ET: Bir haritayı yanlış açıyla, yanlış ölçekte çizmişsin. Elinle
+    "belki 90 derece döndürüp 2 katına çıkarsam düzelir" demek yerine,
+    gerçek birkaç referans noktasını (biliyorsun ki A noktası şurada,
+    B noktası şurada olmalı) kullanıp haritayı TAM olarak doğru açı/
+    ölçek/kaymayla hizalıyorsun -- tahmin değil, hesap.
+SONUÇ: Hizalanmamış (yarışma) ortalama hata ~205-225m'den 25.37m'ye
+    düştü. En büyük tek kazanç buradan geldi -- kötü sayıların çoğu
+    VO'nun kendisinin bozukluğu değil, YANLIŞ ÇERÇEVEDE RAPORLAMAYMIŞ.
+DURUM: KALICI, üretimde.
+
+3. OPTİK AKIŞ TABANLI KALİBRE ÖLÇEK (core/scale_recovery.py)
+-------------------------------------------------------------------
+NE: Ölçek (s = k*Z, k sabit) formülü drone irtifa/hız değiştirdiğinde
+    bozuluyordu. Alternatif: adım uzunluğunu piksel kayması (optik
+    akış) ve irtifadan (s = c * akış_px * Z / f) tahmin etmek. Ham
+    akış kazanmadı, ama warmup'ta GT'den öğrenilen bir kalibrasyon
+    çarpanı (c) eklenince (c=0.9552, aynı mantık k_factor'ün öğrenildiği
+    gibi -- hardcode değil) küçük ama tutarlı bir iyileşme verdi.
+HAYAL ET: Adımlarını sayarak yürüyorsun ama adım uzunluğun bazen
+    büyük bazen küçük. "Ortalama bir adım uzunluğu" kullanmak yerine,
+    her adımda BİR ÖNCEKİ deneyimden öğrendiğin bir düzeltme
+    çarpanıyla (mesela "genelde tahminimim gerçekte %5 fazla çıkıyor")
+    ayarlıyorsun.
+SONUÇ: Sim(3) ATE 26.15m -> 24.03m, hizalanmamış mean 25.37m -> 23.12m.
+DURUM: KALICI, üretimde (config.yaml: optical_flow_scale: true).
+
+4. MIN_INLIER_COUNT GATE'İ GERÇEK HALE GETİRME
+-------------------------------------------------------------------
+NE: config'de "en az 40 nokta desteklemeli" diye bir eşik vardı ama
+    kod sadece log'a uyarı basıyor, pozu asla reddetmiyordu -- config
+    değeri süslemeydi.
+HAYAL ET: Kapına "en az 40 kg olmalı" yazan bir tartı koymuşsun ama
+    tartı hiçbir zaman kapıyı kilitlemiyor, sadece "hafif" diye
+    fısıldıyor -- kilit hiç çalışmıyor.
+SONUÇ: Düzeltildi (artık gerçekten reddediyor) ama bu veri setinde
+    HİÇBİR poz bu eşiğin altına düşmüyor -- ölçülebilir etki SIFIR.
+    Yön hatasının kaynağının bu olmadığını KESİN olarak gösterdi.
+DURUM: KALICI (doğru davranış), ama bu spesifik problem için etkisiz.
+
+===================================================================
+BAŞARISIZ / REDDEDİLEN YÖNTEMLER (denendi, entegre edilmedi)
+===================================================================
+
+5. RETVAL<=0 GATE (essential matrix, core/motion_estimator.py)
+-------------------------------------------------------------------
+NE: cv2.recoverPose'un "kaç nokta kazanan adayı destekliyor" bilgisini
+    (retval) atıp hiç kullanmıyorduk. retval=0 olan 4 karede (hiçbir
+    aday güvenilir değil) yine de poz kabul ediliyordu.
+HAYAL ET: Bir oylamada "kimse net kazanmadı, kararsız kaldık" denildiği
+    an, yine de rastgele birini "kazandı" ilan edip devam etmek.
+SONUÇ KARIŞIK: Sim(3) ATE çok iyileşti (51.8m->26m, trajectory ŞEKLİ
+    düzeldi) ama hizalanmamış (ham) metrik kötüleşti (108.6m->204.9m,
+    ölçek 0.976->1.144 sıçradı). KARAR: gate TUTULDU -- şekli bozuk
+    bir trajectory hiçbir kalibrasyonla kurtarılamaz, önce şekil.
+    Ölçek sıçramasının kökü sonra optik akış (yöntem 3) ile ayrıca
+    çözüldü.
+DURUM: KALICI ama trade-off'u not edilmiş.
+
+6. SCIPY WINDOWED BA v1 -- naif ardışık çift (bacheck.py)
+-------------------------------------------------------------------
+NE: 6 kareli bir pencerede, SADECE ardışık kare çiftlerinin (frame
+    i/i+1) eşleşmelerini kullanıp, rotasyonu piksel hatasını minimize
+    edecek şekilde küçük düzeltmelerle (scipy) ayarladık.
+HAYAL ET: "Bundle adjustment" (BA), birkaç fotoğraftaki aynı noktanın
+    hepsinde tutarlı görünmesini sağlayacak şekilde kamera pozlarını
+    BİRLİKTE düzeltmek. Ama burada her kare çiftinin eşleşen noktaları
+    FARKLIYDI (frame0-1 çiftindeki nokta, frame1-2 çiftindekiyle aynı
+    fiziksel nokta olduğu garanti değildi) -- yani aslında "birlikte"
+    bakmıyorduk, iki ayrı 2-kareli problemi rastgele bir arada
+    çözmeye çalışıyorduk.
+SONUÇ: Sim(3) ATE 24.14m -> 67.72m. KÖTÜLEŞTİ.
+DURUM: REDDEDİLDİ.
+
+7. SCIPY WINDOWED BA v2 -- gerçek çok-kareli track + paralaks gate
+-------------------------------------------------------------------
+NE: v1'in eksiğini (gerçek çoklu-kare kanıtı yok) düzelttik -- aynı
+    fiziksel noktayı pencere boyunca zincirleyip (frame_011'in aynı
+    keypoint'i hem 010-011 çiftinde hem 011-012 çiftinde kullanılıyor,
+    o yüzden koordinatları birebir eşleşiyor) gerçek "track" kurduk.
+    Düşük-paralaks (kameralar birbirine çok yakın) noktaları da eledik.
+HAYAL ET: Artık gerçekten AYNI ağacı 6 fotoğrafta takip ediyorsun,
+    her fotoğrafta o ağacın nerede göründüğünü not ediyorsun -- v1'de
+    her fotoğraf çiftinde farklı bir ağaca bakıyordun.
+SONUÇ: Sim(3) ATE 65.60m. Hâlâ kötü, ama v1'den biraz daha az kötü.
+DURUM: REDDEDİLDİ (ama mekanizma doğrulandı -- 83/90 pencerede
+    ortalama 44 track hayatta kaldı, yöntem çalışıyor, sonuç kötü).
+
+8. SCIPY WINDOWED BA v3 -- rotasyon + öteleme YÖNÜ birlikte
+-------------------------------------------------------------------
+NE: v2'de sadece rotasyonu düzeltiyorduk, öteleme yönünü tamamen sabit
+    tutuyorduk (sadece uzunluk sabit kalmalıydı, yön de sabitti). v3'te
+    öteleme YÖNÜ de (uzunluk hâlâ sabit) rotasyonla BİRLİKTE optimize
+    edildi.
+HAYAL ET: Pusulanı düzeltmeye çalışırken, ayağının hangi yöne bastığını
+    da (adımın uzunluğuna dokunmadan) düzeltmesine izin vermek --
+    çünkü pusula VE adım yönü birbirine bağlı, birini sabit tutup
+    diğerini değiştirmek yapay bir kısıt.
+SONUÇ: Sim(3) ATE 60.69m. Biraz iyileşti (v2'ye göre) ama hâlâ 2.5x
+    kötü.
+DURUM: REDDEDİLDİ.
+
+9. SCIPY WINDOWED BA v4 -- "prensipli" regularizasyon
+-------------------------------------------------------------------
+NE: Optimizer'a "piksel kanıtına uy AMA orijinal tahminden gerekçesiz
+    uzaklaşma" cezası eklendi. Ceza ağırlığı veri setine özel bir
+    sayı DEĞİL, o adımın kendi inlier sayısından türetildi
+    (residual = f * açı * sqrt(N) -- N arttıkça ceza sıkılaşır, standart
+    hata 1/sqrt(N) mantığıyla).
+HAYAL ET: Bir öğrenciye "cevabını değiştirebilirsin ama az sayıda
+    veriyle verdiğin bir cevabı değiştirmek, çok veriyle verdiğin bir
+    cevabı değiştirmekten daha kolay olsun" demek.
+SONUÇ: Sim(3) ATE 52.96m -- 4 varyantın EN İYİSİ ama hâlâ 2.2x kötü.
+    Bulunan sorun: ceza ile piksel hatasının MUTLAK büyüklükleri aynı
+    huber eşiğini paylaşıyordu, tutarsız ölçeklendirme.
+DURUM: REDDEDİLDİ (ama yöne doğru gidiyordu -- bu GTSAM kararını
+    tetikledi).
+
+10. GTSAM KISA PENCERE BA (6 kare, bacheck_gtsam.py)
+-------------------------------------------------------------------
+NE: v4'ün aynı fikrini (track + paralaks gate + güven-ağırlıklı ceza)
+    GTSAM'e taşıdık -- her faktör (piksel kanıtı, orijinal tahminden
+    uzaklaşma cezası) kendi doğal biriminde (radyan, piksel) kalıyor,
+    v4'teki ortak-ölçek karışıklığı yapısal olarak önleniyor.
+HAYAL ET: Elle "bu ikisini aynı cetvelle ölçelim" demek yerine, her
+    ölçüm türünün kendi cetveliyle ölçülüp, sonunda uzman bir
+    hakemin (GTSAM'in optimize edicisi) hepsini doğru şekilde
+    tartarak birleştirmesi.
+SONUÇ: Sim(3) ATE 22.59m (üretim: 22.54m) -- pratikte HİÇ DEĞİŞMEDİ.
+    Kötüleşmedi (scipy gibi) ama iyileşmedi de. Sebep: ceza formülü
+    "rastgele gürültüyü" (çok nokta = güvenilir) ölçüyor, ama aradığımız
+    hata SİSTEMATİK -- çok nokta sistematik yanlılığı gizlemiyor,
+    tam tersi, ona daha çok güvenmemize sebep oluyor.
+DURUM: REDDEDİLDİ (nötr sonuç).
+
+11. DISAMBIGUATION'I KAYNAĞINDA DÜZELTME TESTİ (disambigcheck.py)
+-------------------------------------------------------------------
+NE: Belki de sorun essential matrix'in 4 adayından YANLIŞINI seçmekti
+    -- bunu test etmek için, üretim kodunu değiştirmeden (monkeypatch),
+    4 adayı da kendi oylamamızla (cheirality+reprojection) puanladık,
+    "kazanan" ile "runner-up" (2.'ci) arasındaki farkın ne kadar
+    belirsiz olduğuna baktık.
+HAYAL ET: 4 farklı "arabanın nereye döndüğü" tahmininden hangisinin
+    doğru olduğuna, sadece iki fotoğrafla değil, hangisinin fotoğraflara
+    en iyi uyduğuna bakarak karar vermek -- ve bu kararın ne kadar
+    "net" (bir tahmin ezici farkla önde) olduğunu ölçmek.
+SONUÇ: 390 E-seçilen karenin 389'unda bizim oylamamız üretimle
+    eşleşti (yöntem doğru). AMA hiçbir karede gerçek bir belirsizlik
+    yoktu (%0) -- doğru aday HER ZAMAN ezici farkla seçiliyordu.
+    Yani sorun HANGİ adayı seçtiğimiz değil.
+DURUM: HİPOTEZ KESİN OLARAK REDDEDİLDİ. (Ama önemli bir yan bulgu:
+    21 Eylül'deki "düşük retval -> yüksek hata" korelasyonunun asıl
+    anlamı netleşti -- az nokta = doğru aday da ZAYIF tahmin ediliyor,
+    yanlış aday seçilmiyor.)
+
+12. KLT UZUN-BAZLI TRACK + GTSAM, SABİT 15 KARE (longtrack_gtsam.py)
+-------------------------------------------------------------------
+NE: bacheck_gtsam'ın 6 kareli track yöntemi (ardışık eşleşmeleri
+    zincirleme) uzun pencerede İŞLEMEZ -- hayatta kalma olasılığı
+    çarpımsal düşer (%68/adım ile 20 karede ~%0.02, pratikte sıfır).
+    Bunun yerine KLT (Lucas-Kanade optik akış) kullandık: bir noktayı
+    pencerenin ilk karesinde bulup, sonraki her karede YENİDEN
+    EŞLEŞTİRMEYE ÇALIŞMADAN, görüntü gradyanlarıyla DOĞRUDAN takip
+    ettik. İleri-geri (forward-backward) tutarlılık kontrolüyle
+    sessizce kayan noktalar elendi.
+HAYAL ET: Arkadaşını her karede yeniden TANIMAYA çalışmak (ORB
+    eşleştirme) yerine, gözünle sürekli TAKİP etmek (KLT) -- bir
+    önceki karede nerede olduğunu bildiğin için küçük bir kaymayı
+    takip etmek, yeniden tanımaktan çok daha kolay ve çok daha fazla
+    kare boyunca hayatta kalıyor.
+SONUÇ: Sim(3) ATE 22.54m -> 21.35m (%5.3 İYİLEŞME).
+       Hizalanmamış mean 147.94m -> 143.96m (%2.7 İYİLEŞME).
+    TÜM ARAŞTIRMA BOYUNCA BA'NIN ÜRETİMİ GEÇTİĞİ İLK VE TEK SONUÇ.
+DURUM: EN İYİ SONUÇ -- henüz core/*.py'ye entegre edilmedi (diagnostic
+    kaldı), ama bu yönün doğru olduğuna dair ilk gerçek kanıt.
+
+13. KLT UYARLANABİLİR (ADAPTİF) PENCERE -- İKİ DENEME, İKİSİ DE KÖTÜ
+-------------------------------------------------------------------
+NE: Sabit 15 kare yerine, kare arası hareket büyüdükçe pencereyi
+    kendiliğinden kısaltmayı denedik (KLT'nin büyük hareketlerde
+    kararsızlaştığını klt_debug.py ile ölçmüştük).
+HAYAL ET: Yürürken adım büyüklüğün arttıkça (koşuya geçtiğinde)
+    "harita okuma molasını" otomatik olarak daha sık vermek.
+İLK DENEME: Bir kod hatası bulundu (kümülatif kayma ile her-adımın-
+    kendi-kayması karıştırılmıştı) -- düzeltildi.
+SONUÇ (düzeltme sonrası, 130px eşik): Sim(3) ATE 22.17m (iyileşme)
+    ama hizalanmamış mean 159.97m (KÖTÜLEŞME, %8).
+SONUÇ (eşik 200px'e gevşetildi): Sim(3) ATE 22.43m, hizalanmamış
+    165.07m -- İKİSİ DE sabit-15'ten (21.35m/143.96m) kötü.
+DURUM: REDDEDİLDİ -- sabit 15 kareye geri dönüldü. Muhtemel sebep:
+    çoğu pencerede kısıtlayan şey hareket eşiği değil, hayatta kalan
+    track sayısı (MIN_ALIVE_TRACKS) çıktı -- yanlış kolu ayarlıyorduk.
+    Daha fazla eşik denemek "sonuç iyi çıkana kadar ayarlama" riskine
+    giriyordu, o yüzden durduk.
+
+===================================================================
+ŞU ANKİ PROBLEMİ NASIL ÇÖZERİZ -- SENTEZ VE ÖNERİLER
+===================================================================
+
+NEREDEYIZ: 13 yöntem denendi. Kalıcı olanlar (1-4) hizalanmamış hatayı
+~220m'den ~23m'ye indirdi -- bu asıl büyük kazanç. Kalan ~20-27
+derecelik yön hatası için 9 farklı BA/disambiguation denemesi (5-13)
+yapıldı; SADECE BİRİ (12 -- KLT uzun-bazlı track) küçük ama gerçek bir
+iyileşme (%5.3) verdi, geri kalanı kötüleşti/nötr kaldı.
+
+NEDEN ÇOĞU BAŞARISIZ OLDU (örüntü): essential matrix kanıtı
+(frame_step=5'te, kısa pencerede) sistematik yön hatasını ayırt etmek
+için yeterince güçlü değil -- disambiguation testi bunun "yanlış aday
+seçme" olmadığını, "doğru aday bile zayıf kanıtla belirleniyor"
+olduğunu gösterdi. Kısa pencerede (6 kare) bunu düzeltmeye çalışan her
+yöntem (5 farklı varyant) başarısız oldu. Pencereyi GERÇEKTEN
+uzatınca (KLT ile, 15 kareye) İLK KEZ işe yaradı -- bu, sorunun
+"optimizasyon yöntemi" değil "kanıt miktarı/kalitesi" olduğunu
+doğruluyor.
+
+ÖNERİLEN SONRAKİ ADIMLAR (öncelik sırasıyla):
+
+A) KLT'yi olgunlaştırmak (EN YÜKSEK ÖNCELİK -- tek pozitif sinyal buradan)
+   - Pencere ortasında track sayısı azalınca YENİ köşe noktaları
+     eklemek (şu an sadece pencere başında bir kere köşe buluyoruz,
+     gerçek VO sistemleri sürekli "besleme" yapar).
+   - Hızlı hareket segmentlerinde (frame ~1190+) frame_step'i o
+     bölgede dinamik olarak düşürmek (kare arası hareketi küçültmek,
+     KLT'nin doğal çalışma aralığına getirmek) -- kanıtın kaynağını
+     iyileştirmek, sonradan düzeltmeye çalışmak yerine.
+   - Bu, core/*.py'ye entegre edilebilecek EN olgun aday.
+
+B) Bağımsız dış referans (kavramsal olarak en güçlü çözüm)
+   - IMU yok, ama "Faz B" (periyodik GNSS yeniden-yakalama --
+     yarışma senaryosunda GT ara sıra geri geliyor) zaten planlanmıştı,
+     henüz yazılmadı. BA'nın çözemediği SİSTEMATİK hatayı, dışarıdan
+     gelen gerçek bir referans (kendi kendine tutarlılık değil)
+     düzeltebilir -- bu, BA'nın yapısal olarak yapamayacağı bir şey.
+
+C) Kalıcı harita + gerçek keyframe tabanlı BA (büyük yatırım, 1.5 ay
+   varken düşünülebilir)
+   - Şu anki her pencere sıfırdan başlıyor (köşe bulma + takip).
+     Gerçek SLAM sistemleri kalıcı bir harita tutar, yeni kareler o
+     haritaya karşı eşleşir -- bu, pencereler arası kaybolan bilgiyi
+     korur.
+
+D) Durum -- sunuma geçmek
+   - Mevcut kazanım (220m->23m + dürüst, iyi teşhis edilmiş açık
+     problem) zaten güçlü bir hikaye. 1.5 ay olduğu için bu seçenek
+     aceleye getirilmiyor, ama her zaman elde bir "yeterince iyi"
+     durak noktası.
+
+===================================================================
+OKUNACAK KAYNAKLAR
+===================================================================
+
+1. Hartley, R. & Zisserman, A. -- "Multiple View Geometry in Computer
+   Vision" (2004). Epipolar geometri, triangulation, essential/
+   fundamental matrix bölümleri -- bugün yaptığımız HER şeyin
+   matematiksel temeli. Özellikle Bölüm 9 (Epipolar Geometry) ve
+   Bölüm 12 (Triangulation).
+
+2. Nistér, D. -- "An Efficient Solution to the Five-Point Relative
+   Pose Problem" (IEEE TPAMI, 2004). Essential matrix'ten R,t
+   çıkarma ve 4-aday disambiguation'ın orijinal/klasik çözümü --
+   disambigcheck.py'de test ettiğimiz mekanizmanın kaynağı.
+
+3. Mur-Artal, R. & Tardós, J.D. -- "ORB-SLAM2" (IEEE Trans. Robotics,
+   2017). Bizim mimarimize en yakın gerçek sistem -- keyframe, local
+   BA, loop closure nasıl birleştiriliyor, doğrudan karşılaştırılabilir.
+
+4. Qin, T., Li, P., Shen, S. -- "VINS-Mono: A Robust and Versatile
+   Monocular Visual-Inertial State Estimator" (2018). Bizim IMU'suz
+   çözmeye çalıştığımız ölçek/yön problemini IMU ile nasıl çözdüklerini
+   gösteriyor -- "olsaydı ne olurdu" karşılaştırması için iyi.
+
+5. Lucas, B.D. & Kanade, T. -- "An Iterative Image Registration
+   Technique with an Application to Stereo Vision" (1981). KLT
+   takibinin orijinal makalesi -- bugün longtrack_gtsam.py'de
+   kullandığımız yöntemin kaynağı.
+
+6. Dellaert, F. & Kaess, M. -- "Factor Graphs for Robot Perception"
+   (Foundations and Trends in Robotics, 2017). GTSAM'in teorik temeli
+   -- factor graph, noise model, marjinalleştirme kavramlarını
+   derinlemesine anlamak için.
+
+7. Zhang, Z. & Scaramuzza, D. -- "A Tutorial on Quantitative
+   Trajectory Evaluation for Visual(-Inertial) Odometry" (IROS 2018).
+   Bizim kullandığımız ATE/Sim(3) hizalama metriklerinin standart
+   referansı -- evaluate_evo.py'nin arkasındaki teori.
