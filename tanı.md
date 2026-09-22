@@ -544,10 +544,94 @@ elle kalibre etmeye çalışmak zaman kaybı olmaya başladı. `core/*.py`'ye
 hiçbir BA kodu entegre edilmedi — üretim hâlâ Umeyama Sim3 + flow-scale
 durumunda (bkz. "Mevcut durum").
 
-**Sıradaki iş:** WSL kurulumu (`wsl --install`), Linux tarafında yeni
-venv + `pip install gtsam` + `pip install -r requirements.txt`, sonra
-GTSAM ile aynı formülasyonu (çok-kareli track + düşük-paralaks gate +
-gürültü-modelli motion-only BA) yeniden yazıp ölç.
+**WSL kurulumu (22-23 Eylül) — kendisi bir yan hikaye.** `wsl --install`
+sadece `VirtualMachinePlatform`'u etkinleştirmiş, `Microsoft-Windows-
+Subsystem-Linux` ve `HypervisorPlatform` devre dışı kalmıştı (bu iki
+Windows optional feature `wsl --install`'ın normalde otomatik açması
+gereken şeyler, bu makinede açmadı — sebep bulunamadı). `wsl -d Ubuntu`
+sessizce sonsuza kadar askıda kalıyordu, hiçbir hata/çıktı vermiyordu.
+Admin PowerShell'de `Enable-WindowsOptionalFeature` ile ikisi elle
+açılıp reboot edildi, sonra çalıştı. Ubuntu 26.04, kullanıcı `root`
+(hiç interaktif kurulum sihirbazı tetiklenmedi çünkü hep `wsl -d Ubuntu
+-- <komut>` ile programatik çağrıldı). Repo `~/drone_semantic_slam`'a
+klonlandı, ham veri (`data/raw_frames` 1.5GB, `detections.json`)
+Windows'tan (`/mnt/c/...`) kopyalandı. `pip install gtsam` (4.3.0)
+sorunsuz çalıştı (manylinux wheel). Pipeline'ın torch/ultralytics'e
+ihtiyacı olmadığı doğrulandı (sadece `numpy, opencv, scipy, pyyaml`
+gerekiyor — `utils/visualizer.py`'de `from torch import gt` gibi
+kullanılmayan bir import var ama biz visualizer'ı hiç import etmedik).
+
+**GTSAM sonucu (`bacheck_gtsam.py`, 23 Eylül): scipy'den farklı bir
+başarısızlık modu, ama hâlâ başarısızlık.**
+
+```
+                                    URETIM      GTSAM BA
+Sim(3) ATE                          22.54 m     22.59 m    <- pratikte AYNI
+HIZALANMAMIS mean                  147.94 m    147.44 m    <- pratikte AYNI
+```
+
+scipy'deki gibi KÖTÜLEŞMEDİ (v1-v4: 53-68m), ama hiç de İYİLEŞMEDİ —
+GTSAM'e verilen prior (`sigma = piksel_gurultu/(f*sqrt(N))`, N≈40-80)
+o kadar sıkı çıktı (~0.005°) ki optimizer'a pratikte hareket alanı
+kalmadı. Kök sorun: bu formül "kaç nokta destekliyor" bilgisini
+**rastgele gürültüyü** ölçmek için kullanıyor, ama aradığımız şey
+**sistematik** bir hata — nokta sayısı artınca rastgele gürültü güveni
+yükselir ama sistematik hata görünmez kalır (kendi kendine tutarlılık
+kontrolü sistematik yanlılığı göremez, çünkü kanıtın kendisi de aynı
+yanlı mekanizmadan üretiliyor).
+
+**Sonuç: scipy (gevşek regularizasyon → kötüleşir) ile GTSAM (sıkı,
+prensipli prior → hiç değişmez) aynı temel gerçeği iki uçtan gösteriyor
+— 6 karelik pencerede piksel kanıtı, aradığımız sistematik yön hatasını
+ayırt edecek kadar güçlü değil.**
+
+### Disambiguation'ı kaynağında düzeltme denemesi (`disambigcheck.py`, 23 Eylül): REDDEDİLDİ, ama netleştirici
+
+Hipotez: BA'yı seçim SONRASI değil, essential matrix'ten R,t seçilirken
+(4 aday arasından) düzeltmek — belirsiz kararlarda 1-2 kare ötesine
+bakmak. Test etmeden önce "gerçekten belirsizlik var mı" diye ölçüldü:
+
+`core/motion_estimator.py`'ye DOKUNMADAN (monkeypatch ile `_decompose_
+essential`'ın gördüğü E/mask'i yakalayıp), üretimin kullandığı E'yi
+`cv2.decomposeEssentialMat` ile 4 adaya ayırıp kendi cheirality+
+reprojection oylamamızı yaptık (motion_estimator'ın H tarafındaki
+mantığın aynısı):
+
+```
+E secilen adim sayisi                          : 390
+Bizim oylamamiz uretimin secimiyle eslesiyor   : 389/390   <- yontem dogru
+BELIRSIZ adim (kazanan/runner-up oyu yakin)    : 0 / 390   (%0)
+Kazanan yon hatasi (medyan)                    : 25.51°
+Runner-up (2. aday) yon hatasi                 : 153.78°   <- cok daha kotu
+```
+
+**Hiçbir karede gerçek bir "hangi aday doğru, belirsiz" durumu yok** —
+doğru aday her zaman ezici bir farkla seçiliyor. Yani sorun **hangi
+adayı seçtiğimiz değil**; doğru aday zaten her zaman doğru seçiliyor
+ve buna rağmen ~25° hata kalıyor.
+
+**Bu, 21 Eylül'deki `hecheck.py` bulgusunu da netleştiriyor:** o zaman
+"düşük retval → yüksek hata" korelasyonu "yanlış aday seçiliyor" olarak
+yorumlanmıştı. Gerçekte: düşük retval = az nokta bu adımı destekliyor =
+**doğru aday da zayıf/belirsiz tahmin ediliyor** (yanlış aday seçimi
+değil). Kanıt zayıfken doğru cevap da kötü oluyor — hangi cevabı
+seçtiğimizle ilgisi yok.
+
+**Genel sonuç (23 Eylül, üç bağımsız yaklaşım da aynı duvara çarptı):**
+scipy BA, GTSAM BA, ve disambiguation-kaynağında-düzeltme — üçü de
+farklı açılardan aynı şeyi doğruluyor: `frame_step=5` aralığındaki
+essential matrix kanıtı, aradığımız sistematik yön hatasını düzeltmek
+için yeterince güçlü/hassas değil. Bu bir kod hatası değil, mevcut
+veri/geometriyle ulaşılan bir sınır. Yön hatası şu an **açık, iyi
+teşhis edilmiş ama çözülmemiş** bir problem olarak bırakılıyor.
+
+**Bundan sonrası için adaylar (henüz denenmedi, öncelik kullanıcıyla
+konuşulacak):** (a) gerçek uzun-bazlı track'ler (15-30 kare, KLT/gerçek
+takip, şansa bağlı pairwise hayatta kalma değil) ile BA'yı tekrar
+denemek, (b) bağımsız bir dış referans (IMU yok ama periyodik GNSS
+yeniden-yakalama zaten "Faz B" olarak planlıydı) ile sistematik hatayı
+gerçekten düzeltmek, (c) burada durup dürüstçe belgeleyip projenin
+sunum/temizlik tarafına geçmek.
 
 ## Oturum notu (22 Eylül) — ctrl+S/overwrite ile kayıp ve kurtarma
 
