@@ -625,13 +625,75 @@ için yeterince güçlü/hassas değil. Bu bir kod hatası değil, mevcut
 veri/geometriyle ulaşılan bir sınır. Yön hatası şu an **açık, iyi
 teşhis edilmiş ama çözülmemiş** bir problem olarak bırakılıyor.
 
-**Bundan sonrası için adaylar (henüz denenmedi, öncelik kullanıcıyla
-konuşulacak):** (a) gerçek uzun-bazlı track'ler (15-30 kare, KLT/gerçek
-takip, şansa bağlı pairwise hayatta kalma değil) ile BA'yı tekrar
-denemek, (b) bağımsız bir dış referans (IMU yok ama periyodik GNSS
+**Not (kullanıcı, 23 Eylül):** proje süresi 1 hafta değil **1.5 ay** —
+bu, kök nedene inmeye devam etmeyi (sadece sunuma geçmeyi değil)
+mantıklı kılıyor.
+
+### Uzun-bazlı KLT track denemesi (23 Eylül) — İLK KEZ küçük ama gerçek bir kazanç, sonra bir bug
+
+**Adım 1 — sabit 15 kare pencere + KLT (`longtrack_gtsam.py`, ilk hali):**
+`bacheck_gtsam.py`'nin 6 kareli pencere+pairwise-eşleşme-zincirleme
+track yöntemi 15+ kareye uzatılamaz (hayatta kalma olasılığı çarpımsal
+düşer: ölçülen ~%68/adım hayatta kalma ile 20 karede ~%0.02 — pratikte
+sıfır). Bunun yerine KLT (Lucas-Kanade optik akış) kullanıldı: bir
+noktayı pencerenin ilk karesinde bulup, sonraki her karede yeniden
+eşleştirmeye çalışmadan, görüntü gradyanlarıyla doğrudan takip etmek.
+İleri-geri (forward-backward) tutarlılık kontrolüyle sessizce kayan
+noktalar elendi.
+
+**Sonuç: İLK KEZ BA üretimi geçti (küçük ama gerçek):**
+
+```
+                                    URETIM      BA (KLT 15-kare + GTSAM)
+Sim(3) ATE                          22.54 m     21.35 m    <- %5.3 iyilesme
+HIZALANMAMIS mean (bu diagnostic'in
+  kendi kaba hizalamasiyla)        147.94 m    143.96 m    <- %2.7 iyilesme
+```
+
+31 pencerenin sadece 21'inde track hayatta kaldı — 238-434 kare
+aralığında (raw ~frame_001190+) çoğu pencerede **hiç** track kalmadı.
+
+**Kök neden teşhisi (`klt_debug.py`):** sorun doku/köşe eksikliği değil
+(400 köşe her zaman bulunuyor, maske alanı ~%100) — **kare arası hareket
+büyüklüğü**. "İyi" pencerede (frame 0-70) kümülatif kayma 14 hopta
+yavaşça ~89px'e çıkıyor; "çöken" pencerelerde (frame 1190+) kayma
+6-10. hopta 100-400px'e fırlıyor — muhtemelen o segmentte irtifa/hız
+farklı (daha önce ölçek analizinde de bulunmuştu: drone irtifa/hız
+değiştiriyor). KLT penceresini/piramit seviyesini büyütmek
+(31→63px, 4→6 seviye) hafif iyileştirdi ama temel sorunu çözmedi —
+bazı segmentlerde kayma 300-400px'e çıkıyor, sabit uzunluklu hiçbir
+pencere bunu güvenilir takip edemez.
+
+**Adım 2 — uyarlanabilir (adaptive) pencere denemesi: BUG BULUNDU, henüz
+çözülmedi.** Fikir: pencere uzunluğunu sabit tutmak yerine, kümülatif
+kayma bir eşiği (85px — "iyi" penceredeki hâlâ güvenilir takip
+seviyesinden türetildi, veri setine özel ayarlanmadı) geçince ya da
+hayatta kalan track sayısı çok azalınca pencereyi kapatmak, hareket
+büyüdükçe kendiliğinden kısalması. **Gözlenen anormallik:** ilk pencere
+(frame 0-35) 8 kareye çıktı (beklenen), ama ondan SONRAKİ hemen hemen
+HER pencere tam olarak 4 karede (minimum sınır, `MIN_WINDOW`) kesildi —
+bu kadar düzenli bir kesilme gerçek hareketle açıklanamaz, mantıkta bir
+hata olmalı (muhtemelen kümülatif kayma hesabında ya da durdurma
+koşulunun `i>=MIN_WINDOW-1` ile erken tetiklenmesinde). Ayrıca rapor
+satırında kaldırılan bir sabite (`LONG_WINDOW`) referans kalmış, script
+en sonda çöküyordu — bu düzeltildi (kozmetik), ama pencere-uzunluğu
+bug'ı **çözülmedi**.
+
+**Yarın ilk iş:** `longtrack_gtsam.py`'deki `build_long_tracks`
+fonksiyonunun durdurma mantığını (`med_disp`/`n_alive` hesaplarını,
+`klt_debug.py` ile birebir karşılaştırarak) debug etmek — neden ikinci
+pencereden itibaren hep tam `MIN_WINDOW` uzunluğunda kesildiğini bulup
+düzeltmek, sonra ölçmek. `git status` ile dosyaların gerçekten ne
+içerdiğini kontrol etmeden devam etme (bkz. aşağıdaki ctrl+S dersi).
+
+**Bundan sonrası için adaylar (öncelik kullanıcıyla konuşulacak):**
+(a) uzun-bazlı KLT track'i düzgün çalışır hale getirip (bug'ı çöz)
+ölçmeye devam etmek — şu ana kadarki TEK pozitif sinyal bu yönden
+geldi, (b) bağımsız bir dış referans (IMU yok ama periyodik GNSS
 yeniden-yakalama zaten "Faz B" olarak planlıydı) ile sistematik hatayı
 gerçekten düzeltmek, (c) burada durup dürüstçe belgeleyip projenin
-sunum/temizlik tarafına geçmek.
+sunum/temizlik tarafına geçmek — ama artık 1.5 aylık süre olduğu için
+(c) aceleye getirilmeyecek.
 
 ## Oturum notu (22 Eylül) — ctrl+S/overwrite ile kayıp ve kurtarma
 
