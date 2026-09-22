@@ -1,11 +1,11 @@
 camera_rgb:
-  fx: 2680.51
-  fy: 2683.39
-  cx: 1908.48
-  cy: 1139.71
+  fx: 2779.40
+  fy: 2774.20
+  cx: 1908.01
+  cy: 1117.79
   distortion_coefficients:
-    - 0.0798
-    - -0.1867
+    - 0.1378
+    - -0.2564
     - 0.0
     - 0.0
     - 0.0
@@ -41,7 +41,7 @@ hybrid:
   min_inlier_count: 40
   deep_feature_interval: 20
 evaluation:
-  optical_flow_scale: true
+  optical_flow_scale: false
   ground_truth_file: data/ground-truth.csv
   altitude_source: gt
   gt_z_is_down: true
@@ -51,7 +51,8 @@ evaluation:
   calculate_ate: true
   ate_3d: true
   force_2d: false
-  min_sim3_samples: 10
+  swap_xy: true
+  flip_y: true
   frame_step: 5
 logging:
   level: INFO

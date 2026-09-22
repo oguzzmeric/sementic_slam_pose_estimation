@@ -161,6 +161,11 @@ class ScaleRecovery:
         self._k_factor: Optional[float] = None
         self._calibrated: bool = False
         self._flow_scale = bool(eval_cfg.get("optical_flow_scale", False))
+        # s = c * flow_px * Z / f. Raw flow scale (c=1) has a systematic
+        # bias (~13% overestimate, measured in flowcheck3.py); c corrects
+        # it the same way k corrects s=k*Z, learned from warmup GT pairs.
+        self._flow_c_history: List[float] = []
+        self._flow_c_factor: Optional[float] = None
 
         # diagnostics: bbox depth vs reference altitude
         self._depth_pairs: List[Tuple[float, float]] = []
@@ -435,6 +440,16 @@ class ScaleRecovery:
                 self._warmup_scale_mean, len(self._k_history),
             )
 
+        if len(self._flow_c_history) >= self._MIN_K_SAMPLES:
+            self._flow_c_factor = float(np.median(self._flow_c_history))
+            logger.info(
+                "[ScaleRecovery] Flow calibration -- c=%.4f (%d samples, std=%.4f)",
+                self._flow_c_factor, len(self._flow_c_history),
+                float(np.std(self._flow_c_history)),
+            )
+        else:
+            self._flow_c_factor = None
+
         if len(self._depth_pairs) >= 5:
             a = np.array(self._depth_pairs)
             ratio = a[:, 0] / np.maximum(a[:, 1], 1e-9)
@@ -517,6 +532,13 @@ class ScaleRecovery:
             if s_ref is not None and z is not None and z > 1e-9:
                 self._k_history.append(s_ref / z)
 
+            if self._flow_scale and match_result is not None and s_ref is not None and z is not None:
+                flow_px = float(np.median(np.linalg.norm(
+                    match_result.pts_curr - match_result.pts_prev, axis=1)))
+                denom = flow_px * z / self._f
+                if denom > 1e-9:
+                    self._flow_c_history.append(s_ref / denom)
+
             # Diagnostic: how well does bbox depth track reference altitude.
             # This is what caught the NED sign error -- the ratio came out
             # at 134 instead of 1.0.
@@ -549,7 +571,8 @@ class ScaleRecovery:
                 z = self._smoothed(z)
                 flow = float(np.median(np.linalg.norm(
                     match_result.pts_curr - match_result.pts_prev, axis=1)))
-                scale = flow * z / self._f
+                c = self._flow_c_factor if self._flow_c_factor is not None else 1.0
+                scale = c * flow * z / self._f
                 base = self._warmup_scale_mean or 1.0
                 if self._SCALE_LOWER_MULT * base <= scale <= self._SCALE_UPPER_MULT * base:
                     return ScaleResult(
