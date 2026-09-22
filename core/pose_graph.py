@@ -3,16 +3,30 @@ core/pose_graph.py
 ===================
 Pose graph and trajectory accumulation module.
 
-Math:
+Local VO chain:
     T_world = T_world * T_local
     T_local = [R | t_scaled]
               [0 |     1   ]
-    position = T_world[:3, 3]
+    raw_position = T_world[:3, 3]
+
+The chain above lives in an arbitrary "local" frame -- its origin and axis
+orientation come from the first camera pose, not from the GT/world frame.
+Reporting raw_position directly (or guessing a fixed axis swap) only works
+by luck. Instead, while GT is available (scale_result.mode == "warmup"),
+every (raw_position, GT) pair is collected; the moment GT stops being
+available a Umeyama similarity transform (scale + rotation + translation,
+i.e. Sim(3)) is fit once from those pairs and reused for every subsequent
+frame:
+
+    position = s * R_align @ raw_position + t_align
+
+This replaces the old swap_xy/flip_y flags (a hand-guessed 90-degree axis
+swap, fit to one dataset) with a proper least-squares fit -- and gives a
+natural hook for relocalization: whenever GT reappears later, the same
+mechanism can refit and reset accumulated drift.
 
 Coordinate frame flags (config.yaml evaluation section):
-    force_2d : zero out Z accumulation
-    swap_xy  : swap X and Y axes (camera -> world frame)
-    flip_y   : negate Y axis after swap
+    force_2d : zero out Z accumulation (per-step, independent of the fit)
 
 ATE:
     ATE = sqrt(1/N * sum(||t_GT_i - t_est_i||^2))
@@ -66,16 +80,20 @@ class PoseGraph:
         self._eval_cfg = data_loader.get_evaluation_config()
 
         self._force_2d = bool(self._eval_cfg.get("force_2d", False))
-        self._swap_xy  = bool(self._eval_cfg.get("swap_xy",  False))
-        self._flip_y   = bool(self._eval_cfg.get("flip_y",   False))
+        self._min_sim3_samples = int(self._eval_cfg.get("min_sim3_samples", 10))
 
         self._T_world = np.eye(4, dtype=np.float64)
         self._trajectory: List[TrajectoryPoint] = []
         self._frame_idx: int = 0
 
+        # Sim(3) alignment: local-frame -> GT-frame. Fit once from
+        # (raw_position, GT) pairs collected while GT is available.
+        self._local_gt_pairs: List[tuple] = []
+        self._sim3_fit: Optional[tuple] = None  # (s, R, t) once fit
+
         logger.info(
-            "[PoseGraph] Ready -- force_2d=%s, swap_xy=%s, flip_y=%s",
-            self._force_2d, self._swap_xy, self._flip_y,
+            "[PoseGraph] Ready -- force_2d=%s, min_sim3_samples=%d",
+            self._force_2d, self._min_sim3_samples,
         )
 
     # ------------------------------------------------------------------
@@ -89,13 +107,52 @@ class PoseGraph:
         T[:3, 3] = t.flatten()
         return T
 
-    def _apply_coordinate_transform(self, position: np.ndarray) -> np.ndarray:
-        pos = position.copy()
-        if self._swap_xy:
-            pos[0], pos[1] = pos[1].copy(), pos[0].copy()
-        if self._flip_y:
-            pos[1] = -pos[1]
-        return pos
+    @staticmethod
+    def _umeyama(P: np.ndarray, Q: np.ndarray) -> Optional[tuple]:
+        """
+        Least-squares similarity transform P -> Q: finds (s, R, t) minimizing
+        sum ||s*R@p_i + t - q_i||^2. Standard Umeyama/Kabsch solution via SVD.
+
+        Returns None if P is degenerate (near-zero spread -- SVD would be
+        numerically meaningless).
+        """
+        Pt = P.T
+        Qt = Q.T
+        n = Pt.shape[1]
+        mu_p = Pt.mean(axis=1, keepdims=True)
+        mu_q = Qt.mean(axis=1, keepdims=True)
+        Pc = Pt - mu_p
+        Qc = Qt - mu_q
+
+        var_p = (Pc ** 2).sum() / n
+        if var_p < 1e-9:
+            return None
+
+        W = Qc @ Pc.T / n
+        U, D, Vt = np.linalg.svd(W)
+        S = np.eye(3)
+        if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+            S[2, 2] = -1
+        R = U @ S @ Vt
+        s = float(np.trace(np.diag(D) @ S) / var_p)
+        t = (mu_q - s * R @ mu_p).flatten()
+        return s, R, t
+
+    def _fit_sim3(self) -> Optional[tuple]:
+        if len(self._local_gt_pairs) < self._min_sim3_samples:
+            return None
+        P = np.array([p[0] for p in self._local_gt_pairs])
+        Q = np.array([p[1] for p in self._local_gt_pairs])
+        return self._umeyama(P, Q)
+
+    def _report_position(self, raw_position: np.ndarray) -> np.ndarray:
+        """Maps a local-frame position into the GT/world frame using the
+        fitted Sim(3) transform. Before a fit exists (not enough GT samples
+        collected yet) the raw local position is returned as-is."""
+        if self._sim3_fit is None:
+            return raw_position.copy()
+        s, R, t = self._sim3_fit
+        return s * (R @ raw_position) + t
 
     # ------------------------------------------------------------------
     # Public API
@@ -110,7 +167,7 @@ class PoseGraph:
         self._frame_idx += 1
 
         if not pose.is_valid or not scale_result.is_valid:
-            position = self._apply_coordinate_transform(self._T_world[:3, 3])
+            position = self._report_position(self._T_world[:3, 3])
             R_world = self._T_world[:3, :3].copy()
             point = TrajectoryPoint(
                 frame_name=frame_name,
@@ -143,7 +200,18 @@ class PoseGraph:
             self._T_world[2, 3] = 0.0
 
         raw_position = self._T_world[:3, 3].copy()
-        position = self._apply_coordinate_transform(raw_position)
+
+        gt = self._loader.get_ground_truth(frame_name)
+        if scale_result.mode == "warmup" and gt is not None:
+            # GT is available -- collect a correspondence sample and report
+            # GT directly (no need to estimate what we already know).
+            self._local_gt_pairs.append((raw_position.copy(), gt.as_vector()))
+            position = gt.as_vector().copy()
+        else:
+            if self._sim3_fit is None:
+                self._sim3_fit = self._fit_sim3()
+            position = self._report_position(raw_position)
+
         R_world = self._T_world[:3, :3].copy()
 
         point = TrajectoryPoint(
@@ -178,7 +246,7 @@ class PoseGraph:
     @property
     def current_position(self) -> np.ndarray:
         raw = self._T_world[:3, 3].copy()
-        return self._apply_coordinate_transform(raw)
+        return self._report_position(raw)
 
     @property
     def current_rotation(self) -> np.ndarray:
@@ -254,13 +322,13 @@ class PoseGraph:
         logger.info("[PoseGraph] Saved: %s (%d points)", path, len(self._trajectory))
 
     def __repr__(self) -> str:
+        fit = "pending" if self._sim3_fit is None else f"s={self._sim3_fit[0]:.4f}"
         return (
             f"PoseGraph("
             f"total={len(self._trajectory)}, "
             f"valid={len(self.valid_trajectory)}, "
             f"force_2d={self._force_2d}, "
-            f"swap_xy={self._swap_xy}, "
-            f"flip_y={self._flip_y})"
+            f"sim3={fit})"
         )
 
 

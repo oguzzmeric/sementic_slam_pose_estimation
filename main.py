@@ -163,7 +163,7 @@ def run_pipeline(
 
             # Scale recovery
             try:
-                scale_result = scale_rec.recover(pose, frame_name)
+                scale_result = scale_rec.recover(pose, frame_name,match_result=match_result)
             except ScaleRecoveryError as e:
                 logger.warning("Scale recovery failed at %s: %s", frame_name, e)
                 prev_features = curr_features

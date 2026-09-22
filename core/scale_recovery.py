@@ -160,6 +160,7 @@ class ScaleRecovery:
         self._warmup_scale_mean: Optional[float] = None
         self._k_factor: Optional[float] = None
         self._calibrated: bool = False
+        self._flow_scale = bool(eval_cfg.get("optical_flow_scale", False))
 
         # diagnostics: bbox depth vs reference altitude
         self._depth_pairs: List[Tuple[float, float]] = []
@@ -485,7 +486,7 @@ class ScaleRecovery:
     # public API
     # ------------------------------------------------------------------
 
-    def recover(self, pose: PoseEstimate, frame_name: str) -> ScaleResult:
+    def recover(self, pose: PoseEstimate, frame_name: str, match_result=None) -> ScaleResult:
         self._frame_count += 1
         idx = self._frame_count
 
@@ -541,6 +542,20 @@ class ScaleRecovery:
         # --------------------------------------------------------------
         if not self._calibrated:
             self._finalize()
+
+        if self._flow_scale and match_result is not None:
+            z, cls, src = self._altitude(frame_name)
+            if z is not None:
+                z = self._smoothed(z)
+                flow = float(np.median(np.linalg.norm(
+                    match_result.pts_curr - match_result.pts_prev, axis=1)))
+                scale = flow * z / self._f
+                base = self._warmup_scale_mean or 1.0
+                if self._SCALE_LOWER_MULT * base <= scale <= self._SCALE_UPPER_MULT * base:
+                    return ScaleResult(
+                        scale=scale, t_scaled=scale * pose.t, mode="autonomous",
+                        is_valid=True, frame_name=frame_name,
+                        reference_class=cls, estimated_depth=z, depth_source=src)
 
         scale, z, cls, src = self._autonomous(frame_name)
 

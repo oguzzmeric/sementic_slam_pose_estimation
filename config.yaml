@@ -41,6 +41,7 @@ hybrid:
   min_inlier_count: 40
   deep_feature_interval: 20
 evaluation:
+  optical_flow_scale: false
   ground_truth_file: data/ground-truth.csv
   altitude_source: gt
   gt_z_is_down: true
@@ -50,8 +51,7 @@ evaluation:
   calculate_ate: true
   ate_3d: true
   force_2d: false
-  swap_xy: true
-  flip_y: true
+  min_sim3_samples: 10
   frame_step: 5
 logging:
   level: INFO

@@ -171,8 +171,6 @@ class CameraCalibration:
             m1type=cv2.CV_32FC1,
         )
 
-        print(f"\n map1 : {map1}, map2 : {map2} \n")
-
         logger.debug(
             "[CameraCalibration] Undistort map'leri hesaplandı: %dx%d", width, height
         )
@@ -206,8 +204,6 @@ class CameraCalibration:
                 f"Beklenen: {self.image_width}x{self.image_height}, "
                 f"Alınan: {w}x{h}"
             )
-        print(f"\n undistort map1 : {self._undistort_map1}, map2 : {self._undistort_map2} \n")
-
         return cv2.remap(
             frame,
             self._undistort_map1,
@@ -237,8 +233,6 @@ class CameraCalibration:
         u = self.fx * (X / Z) + self.cx
         v = self.fy * (Y / Z) + self.cy
 
-        print(f"\n project_point : u={u}, v={v} \n")
-
         return np.array([u, v], dtype=np.float64)
 
     def backproject_point(self, pixel: np.ndarray, depth: float) -> np.ndarray:
@@ -259,7 +253,6 @@ class CameraCalibration:
         p_hom = np.array([u, v, 1.0], dtype=np.float64)
         p_cam = depth * (self.K_inv @ p_hom)
 
-        print(f"\n backproject_point : X={p_cam[0]}, Y={p_cam[1]}, Z={p_cam[2]} \n")
         return p_cam
 
     def summary(self) -> str:

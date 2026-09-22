@@ -299,8 +299,9 @@ class MotionEstimator:
         fx, fy = self._cam.fx, self._cam.fy
         cx, cy = self._cam.cx, self._cam.cy
  
-        # camera 1 sits at the world origin
-        P1 = self._K @ np.hstack([np.eye(3), np.zeros((3, 1))])
+        # camera 1 sits at the world origin -- points are already normalized
+        # (K_inv applied below), so P1/P2 must NOT reapply K here.
+        P1 = np.hstack([np.eye(3), np.zeros((3, 1))])
         O1 = np.zeros(3)
  
         reproj_th_sq = self._REPROJ_THRESHOLD ** 2
@@ -319,7 +320,7 @@ class MotionEstimator:
                 continue
  
             t_unit = t_cand / t_norm
-            P2 = self._K @ np.hstack([R_cand, t_cand])
+            P2 = np.hstack([R_cand, t_cand])
  
             # camera 2 centre in world coordinates
             O2 = (-R_cand.T @ t_cand).flatten()
@@ -335,7 +336,6 @@ class MotionEstimator:
  
                 p1 = K_inv @ np.array([u1, v1, 1.0])
                 p2 = K_inv @ np.array([u2, v2, 1.0])
- 
                 # --- DLT triangulation ---
                 A = np.array([
                     p1[0] * P1[2] - P1[0],
@@ -436,11 +436,17 @@ class MotionEstimator:
         e_inlier_mask: np.ndarray,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], np.ndarray]:
         try:
-            _, R, t, _ = cv2.recoverPose(
+            retval, R, t, _ = cv2.recoverPose(
                 E, pts_prev, pts_curr,
                 cameraMatrix=self._K,
                 mask=e_mask,
             )
+            if retval <= 0:
+                logger.debug(
+                    "[MotionEstimator] recoverPose: no candidate supported "
+                    "by cheirality (retval=%d).", retval,
+                )
+                return None, None, e_inlier_mask
             t_norm = np.linalg.norm(t)
             if t_norm > 1e-9:
                 t = t / t_norm
