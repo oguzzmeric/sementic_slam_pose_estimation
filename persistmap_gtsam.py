@@ -1,22 +1,21 @@
 """
-Uzun-bazli (long-baseline) track + GTSAM motion-only BA.
+Kalici harita (persistent map) denemesi.
 
-bacheck_gtsam.py 6 kareli pencerede, ardisik ORB eslesmelerini
-zincirleyerek track kuruyordu -- bu yontem uzun pencerede (15-30 kare)
-CALISMAZ: her adimda bagimsiz yeniden eslesme+RANSAC gerektigi icin
-hayatta kalma orani carpimsal dusuyor (olcum: ~%68/adim -> 20 karede
-~%0.02 -- pratikte sifir track).
+longtrack_gtsam.py'de her 15 karelik pencere SIFIRDAN track kuruyordu --
+bir pencerenin sonunda hayatta olan bir nokta, sonraki pencere baslayinca
+"unutuluyordu" (koseler yeniden bastan bulunuyordu). Gercek SLAM
+sistemleri bunu yapmaz -- bir noktayi gorebildikleri surece takip
+etmeye devam ederler, pencere siniri diye bir sey yoktur.
 
-Bunun yerine KLT (Lucas-Kanade optik akis) kullaniyoruz: bir noktayi
-pencerenin ILK karesinde bulup, sonraki her karede yeniden eslestirmeye
-CALISMADAN, goruntu gradyanlariyla DOGRUDAN takip ediyoruz. Ileri-geri
-(forward-backward) tutarlilik kontroluyle sessizce kayan noktalar
-eleniyor.
+Burada TUM UCUS boyunca (450 kare) TEK, SUREKLI bir KLT takibi yapiyoruz
+(besleme ile, pencere siniri olmadan). Ortaya cikan (bazilari cok uzun
+olabilecek) track'leri, GTSAM'e verirken 15'er karelik bloklara
+KIRPIYORUZ (hesap yukunu sinirli tutmak icin) -- ama track'in kendisi
+pencere sinirindan etkilenmiyor: bir pencerenin son karesinde hayatta
+olan bir nokta, sonraki pencerede de "hafizasini" koruyor, tam
+gozlem geçmisiyle kullanilabiliyor.
 
-Ayni GTSAM motion-only BA cozucusu (bacheck_gtsam.py'den, degismedi --
-tek degisken track uretim yontemi ve pencere buyuklugu) tekrar
-kullaniliyor -- boylece "uzun track yardimci oluyor mu" sorusuna tek
-degiskenli bir cevap aliyoruz.
+core/*.py'ye dokunmuyor.
 """
 
 import csv
@@ -37,19 +36,17 @@ from core.motion_estimator import MotionEstimator
 from core.scale_recovery import ScaleRecovery
 from core.pose_graph import PoseGraph
 
-MIN_WINDOW = 15     # SABIT 15 kare -- adaptif esik denemeleri (130/200px) ikisi de
-MAX_WINDOW = 15     # bundan daha kotu cikti, en iyi olculen sonuc bu sabit deger.
-DISPLACEMENT_STOP_PX = 1e9   # etkisiz birakildi
-MIN_ALIVE_TRACKS = 0         # etkisiz birakildi
-REPLENISH_THRESHOLD = 200    # aktif track sayisi bunun altina dusunce yeni kose ekle
-REPLENISH_EXCLUDE_RADIUS = 15  # yeni kose, var olan bir track'e bu kadar yakin olmasin
+WINDOW = 15   # optimizasyon bloklarinin boyutu -- TRACK UZUNLUGUNU sinirlamiyor artik
+REPLENISH_THRESHOLD = 200
+REPLENISH_EXCLUDE_RADIUS = 15
+MIN_TRACK_LEN_IN_WINDOW = 8   # pencere icindeki KIRPILMIS parca en az bu kadar uzun olmali
 MAX_TRACKS_PER_WINDOW = 150
 PARALLAX_COS_THRESHOLD = 0.99998
 PIXEL_NOISE_SIGMA = 1.5
 ANCHOR_SIGMA = 1e-6
 KLT_WIN = (63, 63)
 KLT_MAX_LEVEL = 6
-KLT_FB_THRESHOLD = 1.5   # ileri-geri piksel hatasi esigi
+KLT_FB_THRESHOLD = 1.5
 
 loader = DataLoader("config.yaml")
 cam = CameraCalibration(loader)
@@ -83,14 +80,14 @@ for idx, name, frame in loader.frame_generator():
         ))
     prev_features = curr
 
-print(f"toplam adim = {len(steps)}")
+N = len(steps)
+print(f"toplam adim = {N}")
 
 
 def chain(local_rotations, local_translations):
-    N = len(local_rotations)
     R_world = [np.eye(3)]
     t_world = [np.zeros(3)]
-    for i in range(N):
+    for i in range(len(local_rotations)):
         R_world.append(R_world[-1] @ local_rotations[i])
         t_world.append(t_world[-1] + R_world[-2] @ local_translations[i])
     return R_world, t_world
@@ -109,40 +106,28 @@ def clean_gray_and_mask(frame_bgr, frame_name):
     return gray, mask
 
 
-def build_long_tracks(frame_paths, frame_names):
+def build_full_flight_tracks():
     """
-    KLT ile pencerenin ILK karesinden baslar. Aktif track sayisi
-    REPLENISH_THRESHOLD'un altina dusunce, o karede YENI kose noktalari
-    bulup ekler (var olan track'lere yakin olmayacak sekilde) -- boylece
-    pencere ortasinda "besleme" yapilir, sadece basta bulunan koselere
-    bagli kalinmaz.
+    TUM UCUS boyunca SUREKLI KLT takibi -- pencere siniri yok. Aktif
+    track sayisi azalinca besleme yapilir. Bir track sadece takip
+    basarisiz oldugunda (KLT kaybettiginde) sonlanir, pencere
+    bittigi icin degil.
 
-    Her track {'start': pencere-ici baslangic kare indeksi,
-               'obs': [(x,y), ...] -- start'tan itibaren ardisik gozlemler}
-    seklinde -- boylece pencerenin ortasinda baslayan bir track de
-    GTSAM'e dogru kareye bagli bir faktor olarak eklenebilir.
-
-    Doner: (kullanilan_kare_sayisi, tamamlanmis_track_listesi)
+    Doner: global_start (kare indeksi) ve obs (global kare indeksine
+    gore ardisik gozlemler) iceren dict listesi.
     """
-    gray0, mask0 = clean_gray_and_mask(loader.load_frame(frame_paths[0]), frame_names[0])
-    pts0 = cv2.goodFeaturesToTrack(
-        gray0, maxCorners=400, qualityLevel=0.01, minDistance=12, mask=mask0)
-    if pts0 is None or len(pts0) == 0:
-        return 1, []
+    frame_paths = loader.frame_list  # tum ucus, N+1 kare
+    finished = []
+
+    gray_prev, mask_prev = clean_gray_and_mask(loader.load_frame(frame_paths[0]), frame_paths[0].name)
+    pts0 = cv2.goodFeaturesToTrack(gray_prev, maxCorners=400, qualityLevel=0.01, minDistance=12, mask=mask_prev)
+    active = [{"start": 0, "obs": [tuple(p[0])]} for p in pts0] if pts0 is not None else []
 
     lk_params = dict(winSize=KLT_WIN, maxLevel=KLT_MAX_LEVEL,
                       criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
 
-    active = [{"start": 0, "obs": [tuple(p[0])]} for p in pts0]
-    finished = []
-
-    gray_prev = gray0
-    used = 0
-    max_i = min(MAX_WINDOW, len(frame_paths)) - 1
-
-    for i in range(1, max_i + 1):
-        gray_curr, mask_curr = clean_gray_and_mask(loader.load_frame(frame_paths[i]), frame_names[i])
-        used = i
+    for i in range(1, len(frame_paths)):
+        gray_curr, mask_curr = clean_gray_and_mask(loader.load_frame(frame_paths[i]), frame_paths[i].name)
 
         if active:
             pts_in = np.array([a["obs"][-1] for a in active], dtype=np.float32).reshape(-1, 1, 2)
@@ -160,9 +145,6 @@ def build_long_tracks(frame_paths, frame_names):
                     finished.append(a)
             active = new_active
 
-        gray_prev = gray_curr
-
-        # besleme: aktif track azalinca bu karede yeni kose ekle
         if len(active) < REPLENISH_THRESHOLD:
             excl_mask = mask_curr.copy()
             for a in active:
@@ -176,15 +158,15 @@ def build_long_tracks(frame_paths, frame_names):
                     for p in new_pts:
                         active.append({"start": i, "obs": [tuple(p[0])]})
 
-        if not active and i < max_i:
-            break
+        gray_prev = gray_curr
+        if (i % 50) == 0:
+            print(f"  [track] kare {i}/{len(frame_paths)-1}  aktif={len(active)}  bitmis={len(finished)}")
 
     for a in active:
         if len(a["obs"]) >= 2:
             finished.append(a)
 
-    n_frames_used = used + 1
-    return n_frames_used, finished
+    return finished
 
 
 def triangulate_multiview(Ps, pts):
@@ -218,9 +200,6 @@ def projection_matrix(R_w, t_w):
 
 
 def parallax_ok(track, R_init, t_init):
-    """track kendi (start..start+len-1) araligindaki ilk/son gozlemle
-    paralaksini kontrol eder -- pencerenin globalinden degil, kendi
-    yasadigi araliktan."""
     s = track["start"]
     e = s + len(track["obs"]) - 1
     R_first, t_first = R_init[s], t_init[s]
@@ -236,6 +215,19 @@ def parallax_ok(track, R_init, t_init):
         return False
     cos_parallax = float(np.dot(ray1, ray2) / (d1 * d2))
     return cos_parallax <= PARALLAX_COS_THRESHOLD
+
+
+def slice_track_to_window(track, w_start, w_end):
+    """Global track'in [w_start,w_end] penceresiyle kesisen kismini
+    pencere-lokal indekslerle dondurur -- ya da yeterince uzun degilse
+    None."""
+    s = track["start"]
+    e = s + len(track["obs"]) - 1
+    lo, hi = max(s, w_start), min(e, w_end)
+    if lo > hi or (hi - lo + 1) < MIN_TRACK_LEN_IN_WINDOW:
+        return None
+    obs = track["obs"][lo - s: hi - s + 1]
+    return {"start": lo - w_start, "obs": obs}
 
 
 def solve_window(R_init, t_init, tracks, confidence):
@@ -290,34 +282,29 @@ def solve_window(R_init, t_init, tracks, confidence):
 
 
 # --------------------------------------------------------------------
-# 2) uzun pencereler -- KLT track + GTSAM BA
+# 2) TEK surekli KLT gecisi -- tum ucus
+# --------------------------------------------------------------------
+print("Surekli KLT takibi baslatiliyor (tum ucus, besleme ile)...")
+global_tracks = build_full_flight_tracks()
+print(f"toplam bitmis track = {len(global_tracks)}  "
+      f"(uzunluk medyan={np.median([len(t['obs']) for t in global_tracks]):.1f}, "
+      f"max={max(len(t['obs']) for t in global_tracks)})")
+
+# --------------------------------------------------------------------
+# 3) 15'er karelik bloklarda GTSAM BA -- track'ler PENCERE SINIRINI ASABILIYOR
 # --------------------------------------------------------------------
 rng = np.random.default_rng(0)
 R_local_corr = [r.copy() for r in R_local_all]
 t_local_corr = [t.copy() for t in t_local_all]
-N = len(steps)
 
 n_windows_used = 0
 n_tracks_total = 0
-window_sizes = []
 R0, t0 = np.eye(3), np.zeros(3)
 
 start = 0
 while start < N - 1:
-    max_span = min(MAX_WINDOW - 1, N - 1 - start)  # kalan adim sayisiyla sinirli
-    frame_paths = loader.frame_list[start:start + max_span + 2]
-    frame_names = [p.name for p in frame_paths]
-
-    n_frames_used, tracks = build_long_tracks(frame_paths, frame_names)
-    n = n_frames_used - 1  # lokal adim (hop) sayisi
+    n = min(WINDOW - 1, N - 1 - start)
     end = start + n
-    window_sizes.append(n_frames_used)
-
-    if n <= 0:
-        start += 1
-        t0 = t0 + R0 @ t_local_all[start - 1]
-        R0 = R0 @ R_local_all[start - 1]
-        continue
 
     R_init = [R0.copy()]
     t_init = [t0.copy()]
@@ -325,24 +312,29 @@ while start < N - 1:
         t_init.append(t_init[-1] + R_init[-1] @ t_local_all[start + i])
         R_init.append(R_init[-1] @ R_local_all[start + i])
 
-    min_track_len = max(2, (n_frames_used + 1) // 2)  # pencerenin en az yarisi
-    tracks = [tr for tr in tracks if len(tr["obs"]) >= min_track_len and parallax_ok(tr, R_init, t_init)]
+    win_tracks = []
+    for tr in global_tracks:
+        sliced = slice_track_to_window(tr, start, end)
+        if sliced is not None:
+            win_tracks.append(sliced)
 
-    if not tracks:
-        print(f"  pencere [{start}:{end}] (uzunluk={n_frames_used}) -- track yok, atlandi")
+    win_tracks = [tr for tr in win_tracks if parallax_ok(tr, R_init, t_init)]
+
+    if not win_tracks:
+        print(f"  pencere [{start}:{end}] -- track yok, atlandi")
         R0, t0 = R_init[-1], t_init[-1]
         start = end
         continue
 
-    if len(tracks) > MAX_TRACKS_PER_WINDOW:
-        idx = rng.choice(len(tracks), MAX_TRACKS_PER_WINDOW, replace=False)
-        tracks = [tracks[i] for i in idx]
+    if len(win_tracks) > MAX_TRACKS_PER_WINDOW:
+        idx = rng.choice(len(win_tracks), MAX_TRACKS_PER_WINDOW, replace=False)
+        win_tracks = [win_tracks[i] for i in idx]
 
     n_windows_used += 1
-    n_tracks_total += len(tracks)
-    print(f"  pencere [{start}:{end}] (uzunluk={n_frames_used}) -- {len(tracks)} track hayatta kaldi")
+    n_tracks_total += len(win_tracks)
+    print(f"  pencere [{start}:{end}] -- {len(win_tracks)} track (kalici haritadan kirpilmis)")
 
-    R_out, t_out = solve_window(R_init, t_init, tracks, len(tracks))
+    R_out, t_out = solve_window(R_init, t_init, win_tracks, len(win_tracks))
 
     for i in range(n):
         R_local_corr[start + i] = R_out[i].T @ R_out[i + 1]
@@ -351,16 +343,13 @@ while start < N - 1:
     R0, t0 = R_out[-1], t_out[-1]
     start = end
 
-print(f"pencere uzunluklari -- medyan={np.median(window_sizes):.0f}  "
-      f"min={min(window_sizes)}  max={max(window_sizes)}")
-
 print(f"BA uygulanan pencere = {n_windows_used}   toplam track = {n_tracks_total}   "
       f"(ortalama {n_tracks_total / max(n_windows_used,1):.1f}/pencere)")
 
 R_world_ba, t_world_ba = chain(R_local_corr, t_local_corr)
 
 # --------------------------------------------------------------------
-# 3) degerlendirme
+# 4) degerlendirme
 # --------------------------------------------------------------------
 gt = {}
 with open("data/ground-truth.csv", encoding="utf-8") as fh:
@@ -410,7 +399,7 @@ def report(label, est):
 
 
 print("=" * 66)
-print(f"  n={len(gt_arr)} kare, uyarlanabilir pencere (medyan={np.median(window_sizes):.0f}), GTSAM")
+print(f"  n={len(gt_arr)} kare, KALICI HARITA + 15-kare blok, GTSAM")
 print("=" * 66)
 report("URETIM (duzeltmesiz)", prod_arr)
-report("BA (GTSAM, KLT uzun-bazli track)", ba_arr)
+report("BA (kalici harita, kirpilmis track)", ba_arr)

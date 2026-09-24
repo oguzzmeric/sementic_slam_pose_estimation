@@ -714,17 +714,79 @@ Ayrıca "sonraki adımlar" sentezi ve 7 okuma kaynağı (Hartley&Zisserman,
 Nistér, ORB-SLAM2, VINS-Mono, KLT orijinal makale, GTSAM/factor graph
 teorisi, ATE/Sim3 değerlendirme metodolojisi) içeriyor.
 
+## 24 Eylül oturumu — KLT olgunlaştırma denemeleri (besleme, min-uzunluk, frame_step, kalıcı harita)
+
+**14. KLT ORTA-PENCERE BESLEME (corner replenishment) — REDDEDİLDİ.**
+Aktif track sayısı azalınca o karede yeni köşe eklemeyi denedik
+(`REPLENISH_THRESHOLD=200`). Mekanizma çalıştı (her pencerede sürekli
+150 track vardı) ama sonuç kötüleşti: Sim(3) ATE 22.32m, hizalanmamış
+150.43m — beslemesiz sabit-15'ten (21.35-21.74m / 143.53-143.96m) kötü.
+Sebep: pencere ortasında eklenen noktalar kısa süre (az paralaks) takip
+ediliyor, sayıca çoğaldılar ama kalite düştü.
+
+**15. MİNİMUM TRACK UZUNLUĞU FİLTRESİ — KISMEN YARDIMCI.** Besleme +
+"pencerenin en az yarısını (≥8 kare) takip edemeyen track'i BA'ya
+katma" filtresi eklendi. Sim(3) ATE 21.43m'ye (beslemesiz seviyeye)
+geri döndü ama hizalanmamış mean hâlâ kötü (151.08m). Üç beslemeli
+varyantın hiçbiri beslemesiz basit versiyonu geçemedi — bu kolu (besleme
+parametrelerini daha fazla ayarlamayı) kapattık.
+
+**16. HIZLI SEGMENTTE `frame_step` DÜŞÜRME (`densecheck.py`) —
+REDDEDİLDİ, önemli bir yan bulguyla.** Hipotez: KLT'nin çöktüğü hızlı
+segmentte (frame_001190-001260) daha sık örnekleme (adım=1, HER ham
+kare) kare-arası hareketi küçültüp yön tahminini iyileştirir. **Tam
+tersi çıktı:**
+```
+                  SEYREK (adim=5)   YOGUN (adim=1)
+medyan yon hatasi   42.87°           53.67°   <- DAHA KOTU
+```
+Adım=1'de baseline (kameralar arası mesafe) çok küçülüyor, essential
+matrix/triangulation dejenere oluyor (`frame_step=5`'in ilk seçilme
+sebebiydi zaten) — "daha sık = daha iyi" varsayımı çürütüldü. Orta bir
+adım (2-3) denenmedi, kullanıcı bunun yerine daha büyük bir mimari
+soruya (aşağıya) geçmeyi seçti.
+
+**17. KALICI HARİTA (persistent map) — `persistmap_gtsam.py` — EN İYİ
+SONUÇ, YARIŞMA METRİĞİNDE.** Kullanıcının "tüm pipeline'ı gözden
+geçirelim mi" sorusuna cevaben: tam yeniden yazım yerine, tek somut
+yapısal boşluk (her pencere track'leri sıfırdan kuruyordu, pencere
+sınırında hafıza kayboluyordu) hedeflendi. Tüm uçuş (450 kare) boyunca
+TEK, SÜREKLİ bir KLT takibi (besleme ile, pencere sınırı YOK) yapılıp,
+ortaya çıkan (pencere sınırını aşabilen) track'ler GTSAM BA'ya verilirken
+15'er karelik bloklara KIRPILDI — track'in kendisi süreklilik koruyor,
+sadece hesap bloğu 15 kare.
+
+```
+                                    URETIM      Sabit-15 (beslemesiz)   KALICI HARITA
+Sim(3) ATE (sekil)                  22.54 m     21.35-21.74 m            22.92 m    <- biraz kotu
+HIZALANMAMIS mean (YARISMA)        147.94 m    143.53-143.96 m          141.29 m    <- EN IYI (%4.5)
+```
+
+Şekil metriği hafif kötüleşti ama **yarışmanın gerçekte kullandığı
+metrik** (hizalanmamış hata) tüm araştırmanın en iyi sonucuna ulaştı.
+Yorum: bu rastgele bir parametre ayarı değil, gerçek bir yapısal
+düzeltme (track'lerin pencere sınırına takılmaması) — sonucun asıl
+önemli metrikte iyileşmesi bunu destekliyor. Şekil/ham metrik dengesi
+muhtemelen Sim(3)'ün TEK global hizalama uydurmasından kaynaklanıyor
+(düzeltme yoğunluğu pencereden pencereye değişken — 20-150 track arası
+— dağılım düzensizleşti ama nokta-bazlı doğruluk iyileşti).
+
+**Karar (kullanıcı, 24 Eylül):** Burada durup konsolide edildi. Daha
+fazla ayar denemek yerine (besleme/eşik denemelerinde zaten "iyi çıkana
+kadar dene" sınırına yaklaşılmıştı), bu sonuç **bugünün en iyi, kabul
+edilen sonucu** olarak kaydedildi. Henüz `core/*.py`'ye entegre
+edilmedi — 1.5 aylık süre olduğu için entegrasyon kararı aceleye
+getirilmiyor.
+
 **Bundan sonrası için adaylar (öncelik kullanıcıyla konuşulacak,
-1.5 aylık süre var, acele yok):**
-(a) KLT'yi olgunlaştırmak — pencere ortasında yeni köşe ekleme
-(besleme), hızlı hareket segmentlerinde `frame_step`'i dinamik
-düşürmek. Şu ana kadarki TEK pozitif sinyal bu yönden geldi, en olgun
-aday.
+acele yok):**
+(a) `persistmap_gtsam.py`'yi `core/pose_graph.py`'ye temiz bir şekilde
+entegre etmek (üretime almak) — şu ana kadarki en olgun, en iyi
+doğrulanmış aday.
 (b) bağımsız bir dış referans (IMU yok ama periyodik GNSS
 yeniden-yakalama zaten "Faz B" olarak planlıydı) ile sistematik hatayı
 gerçekten düzeltmek.
-(c) kalıcı harita + gerçek keyframe tabanlı BA (büyük yatırım).
-(d) burada durup dürüstçe belgeleyip projenin sunum/temizlik tarafına
+(c) burada durup dürüstçe belgeleyip projenin sunum/temizlik tarafına
 geçmek — her zaman elde bir "yeterince iyi" durak noktası.
 
 ## Oturum notu (22 Eylül) — ctrl+S/overwrite ile kayıp ve kurtarma

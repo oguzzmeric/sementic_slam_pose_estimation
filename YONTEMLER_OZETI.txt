@@ -250,37 +250,100 @@ DURUM: REDDEDİLDİ -- sabit 15 kareye geri dönüldü. Muhtemel sebep:
     Daha fazla eşik denemek "sonuç iyi çıkana kadar ayarlama" riskine
     giriyordu, o yüzden durduk.
 
+14. KLT ORTA-PENCERE BESLEME (corner replenishment, longtrack_gtsam.py)
+-------------------------------------------------------------------
+NE: Aktif track sayısı azalınca, o karede YENİ köşe noktaları bulup
+    eklemeyi denedik (var olan track'lere yakın olmayacak sekilde).
+HAYAL ET: Bir sınıfta öğrenci sayısı azaldıkça yeni öğrenci kaydetmek
+    -- ama yeni gelen öğrenciler dersin sadece kalan kısmını görüyor,
+    baştan beri orada olanlar kadar "tecrübeli" değiller.
+SONUÇ: Mekanizma çalıştı (track sayısı hep 150'de tutuldu) ama sonuç
+    KÖTÜLEŞTİ (Sim3 ATE 22.32m, hizalanmamış 150.43m) -- kısa süre
+    takip edilen (az paralaks) yeni noktalar sayıca çoğaldı ama
+    kalite düşürdü.
+DURUM: REDDEDİLDİ.
+
+15. MİNİMUM TRACK UZUNLUĞU FİLTRESİ
+-------------------------------------------------------------------
+NE: Besleme + "pencerenin en az yarısını takip edemeyen track'i BA'ya
+    katma" filtresi.
+HAYAL ET: Mahkemede 30 saniyelik bulanık bir tanıklığı, 15 dakikalık
+    net bir tanıklıkla aynı ağırlıkta dinlememek.
+SONUÇ: Sim(3) ATE beslemesiz seviyeye geri döndü (21.43m) ama
+    hizalanmamış mean hâlâ kötüydü (151.08m). Beslemeli 3 varyantın
+    hiçbiri beslemesiz basit versiyonu geçemedi.
+DURUM: REDDEDİLDİ (besleme kolu tamamen kapatıldı).
+
+16. HIZLI SEGMENTTE frame_step DÜŞÜRME (densecheck.py)
+-------------------------------------------------------------------
+NE: KLT'nin çöktüğü hızlı segmentte (frame 1190-1260), daha sık
+    örnekleme (her ham kare, adım=1) kare-arası hareketi küçültüp
+    yön tahminini iyileştirir mi diye test ettik.
+HAYAL ET: Koşan bir kediyi her fotoğrafta değil, HER ANDA çekmek
+    hareketi "donduracağını" düşünmek -- ama fotoğraflar birbirine
+    ÇOK yakınsa (neredeyse aynı kare), aralarındaki farktan hiçbir
+    şey öğrenemezsin (iki neredeyse-özdeş fotoğraftan mesafe/açı
+    hesaplamak imkansızlaşır).
+SONUÇ: Tam tersi çıktı -- adım=1'de yön hatası DAHA KÖTÜ (53.67°
+    vs adım=5'in 42.87°), çünkü kameralar arası mesafe (baseline)
+    çok küçülüp geometri sayısal olarak dejenere oldu (frame_step=5'in
+    ilk seçilme sebebi tam olarak buydu).
+DURUM: REDDEDİLDİ. Hipotez ("daha sık = daha iyi") çürütüldü.
+
+17. KALICI HARİTA (persistent map, persistmap_gtsam.py) -- EN İYİ SONUÇ
+-------------------------------------------------------------------
+NE: Her pencerenin (15 kare) SIFIRDAN track kurmasının (bir pencere
+    bitince hayatta olan bir nokta "unutuluyordu") yerine, TÜM UÇUŞ
+    boyunca (450 kare) TEK, SÜREKLİ bir KLT takibi yaptık -- pencere
+    sınırı yok. Ortaya çıkan (pencere sınırını aşabilen, potansiyel
+    olarak çok uzun) track'ler, GTSAM'e verilirken 15'er karelik
+    hesap bloklarına KIRPILDI -- ama track'in kendisi sürekliliğini
+    koruyor.
+HAYAL ET: Bir fotoğrafçının her 15. karede hafızasını sıfırlayıp
+    yeniden "kimdi bu insanlar" diye düşünmesi yerine, aynı insanları
+    tüm gün boyunca takip etmeye devam etmesi -- ne kadar süredir
+    takip ettiğine bakmaksızın, kaydı yaparken sadece "son 15 dakika"lık
+    bir dilimi rapor ediyor olması.
+SONUÇ:
+```
+                                    URETIM      Sabit-15(beslemesiz)  KALICI HARITA
+Sim(3) ATE (sekil)                  22.54 m     21.35-21.74 m          22.92 m
+HIZALANMAMIS mean (YARISMA)        147.94 m    143.53-143.96 m        141.29 m  <- EN IYI (%4.5)
+```
+    Şekil metriği hafif kötüleşti ama yarışmanın GERÇEKTE kullandığı
+    metrik (hizalanmamış hata) tüm araştırmanın en iyi sonucuna
+    ulaştı. Bu, rastgele bir parametre ayarı değil, gerçek bir
+    yapısal düzeltme.
+DURUM: EN İYİ SONUÇ, kabul edildi (24 Eylül). Henüz core/*.py'ye
+    entegre edilmedi.
+
 ===================================================================
-ŞU ANKİ PROBLEMİ NASIL ÇÖZERİZ -- SENTEZ VE ÖNERİLER
+ŞU ANKİ PROBLEMİ NASIL ÇÖZERİZ -- SENTEZ VE ÖNERİLER (güncellendi, 24 Eylül)
 ===================================================================
 
-NEREDEYIZ: 13 yöntem denendi. Kalıcı olanlar (1-4) hizalanmamış hatayı
+NEREDEYIZ: 17 yöntem denendi. Kalıcı olanlar (1-4) hizalanmamış hatayı
 ~220m'den ~23m'ye indirdi -- bu asıl büyük kazanç. Kalan ~20-27
-derecelik yön hatası için 9 farklı BA/disambiguation denemesi (5-13)
-yapıldı; SADECE BİRİ (12 -- KLT uzun-bazlı track) küçük ama gerçek bir
-iyileşme (%5.3) verdi, geri kalanı kötüleşti/nötr kaldı.
+derecelik yön hatası için 13 farklı BA/disambiguation/track denemesi
+(5-17) yapıldı; İKİSİ gerçek kazanç verdi -- KLT uzun-bazlı track
+(sabit 15 kare, %5.3 şekil iyileşmesi) ve KALICI HARİTA (%4.5 yarışma
+metriği iyileşmesi, en iyisi), geri kalanı kötüleşti/nötr kaldı ya da
+(besleme, dinamik frame_step) hipotezleri çürüttü.
 
 NEDEN ÇOĞU BAŞARISIZ OLDU (örüntü): essential matrix kanıtı
 (frame_step=5'te, kısa pencerede) sistematik yön hatasını ayırt etmek
 için yeterince güçlü değil -- disambiguation testi bunun "yanlış aday
 seçme" olmadığını, "doğru aday bile zayıf kanıtla belirleniyor"
-olduğunu gösterdi. Kısa pencerede (6 kare) bunu düzeltmeye çalışan her
-yöntem (5 farklı varyant) başarısız oldu. Pencereyi GERÇEKTEN
-uzatınca (KLT ile, 15 kareye) İLK KEZ işe yaradı -- bu, sorunun
-"optimizasyon yöntemi" değil "kanıt miktarı/kalitesi" olduğunu
-doğruluyor.
+olduğunu gösterdi. Pencereyi GERÇEKTEN uzatınca (KLT ile) ve track'lerin
+pencere sınırına takılmasını kaldırınca (kalıcı harita) işe yaradı --
+sorunun "optimizasyon yöntemi" değil "kanıt miktarı/sürekliliği"
+olduğu iki kez doğrulandı. Ama "daha fazla nokta ekle" (besleme) ya da
+"daha sık örnekle" (frame_step) gibi saf-miktar artırma denemeleri
+işe yaramadı -- kanıtın KALİTESİ/sürekliliği önemli, ham miktarı değil.
 
 ÖNERİLEN SONRAKİ ADIMLAR (öncelik sırasıyla):
 
-A) KLT'yi olgunlaştırmak (EN YÜKSEK ÖNCELİK -- tek pozitif sinyal buradan)
-   - Pencere ortasında track sayısı azalınca YENİ köşe noktaları
-     eklemek (şu an sadece pencere başında bir kere köşe buluyoruz,
-     gerçek VO sistemleri sürekli "besleme" yapar).
-   - Hızlı hareket segmentlerinde (frame ~1190+) frame_step'i o
-     bölgede dinamik olarak düşürmek (kare arası hareketi küçültmek,
-     KLT'nin doğal çalışma aralığına getirmek) -- kanıtın kaynağını
-     iyileştirmek, sonradan düzeltmeye çalışmak yerine.
-   - Bu, core/*.py'ye entegre edilebilecek EN olgun aday.
+A) `persistmap_gtsam.py`'yi üretime (core/pose_graph.py) entegre etmek
+   -- şu ana kadarki en olgun, en iyi doğrulanmış aday.
 
 B) Bağımsız dış referans (kavramsal olarak en güçlü çözüm)
    - IMU yok, ama "Faz B" (periyodik GNSS yeniden-yakalama --
@@ -289,18 +352,11 @@ B) Bağımsız dış referans (kavramsal olarak en güçlü çözüm)
      gelen gerçek bir referans (kendi kendine tutarlılık değil)
      düzeltebilir -- bu, BA'nın yapısal olarak yapamayacağı bir şey.
 
-C) Kalıcı harita + gerçek keyframe tabanlı BA (büyük yatırım, 1.5 ay
-   varken düşünülebilir)
-   - Şu anki her pencere sıfırdan başlıyor (köşe bulma + takip).
-     Gerçek SLAM sistemleri kalıcı bir harita tutar, yeni kareler o
-     haritaya karşı eşleşir -- bu, pencereler arası kaybolan bilgiyi
-     korur.
-
-D) Durum -- sunuma geçmek
-   - Mevcut kazanım (220m->23m + dürüst, iyi teşhis edilmiş açık
-     problem) zaten güçlü bir hikaye. 1.5 ay olduğu için bu seçenek
-     aceleye getirilmiyor, ama her zaman elde bir "yeterince iyi"
-     durak noktası.
+C) Durum -- sunuma geçmek
+   - Mevcut kazanım (220m->23m + %4.5 ek iyileşme + dürüst, iyi
+     teşhis edilmiş süreç) zaten güçlü bir hikaye. 1.5 ay olduğu için
+     bu seçenek aceleye getirilmiyor, ama her zaman elde bir "yeterince
+     iyi" durak noktası.
 
 ===================================================================
 OKUNACAK KAYNAKLAR
