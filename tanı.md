@@ -877,6 +877,54 @@ PERSISTENT-MAP BA        : 57.80 m   (%7.8 iyilesme)
 `data/trajectory_output_persistent_ba.csv` olarak kaydediliyor,
 `data/trajectory_output.csv` (üretim) değişmiyor.
 
+## Hata profili doğrulaması (24 Eylül) — yön hatası hâlâ dominant sebep
+
+Doğru metrik bulunduktan sonra, gerçekten yön hatasının mı yoksa
+gözden kaçırdığımız başka bir şeyin mi asıl sebep olduğunu kontrol
+ettik. `data/trajectory_output.csv` üzerinde 10 dilime bölünmüş hata
+profili:
+
+```
+warmup (GT direkt)     : hata = 0 (beklenen)
+autonomous, zaman ici  : 18m -> 24m -> 56m -> 93m -> 188m (zirve) -> 168m -> 103m
+```
+
+Hata autonomous faza girince **sürekli büyüyor**, en kötü 10 kare
+**tek bitişik bloktan** (frame_001770-001815) geliyor — rastgele
+saçılmış aykırı değerler değil, klasik birikimli drift imzası. Zirve
+sonrası düşüş, tracking'in düzelmesi değil, tahmin edilen yol ile
+GT'nin geometrik olarak tesadüfen yakınlaşması. **Sonuç: yön hatası
+hipotezi doğru, başka gözden kaçan büyük bir sebep yok** — persistent
+map yatırımına devam etmek mantıklı.
+
+## Persistent BA parametre taraması (24 Eylül) — `window` büyütmek KÖTÜLEŞTİRDİ
+
+`config.yaml:persistent_ba.window`'u 15'ten 25'e çıkarıp
+`refine_trajectory.py` ile (artık DOĞRU metrikle) ölçtük:
+
+```
+                       URETIM      window=15    window=25
+PERSISTENT-MAP BA       62.66 m     57.80 m      61.06 m
+iyilesme                             %7.8         %2.6
+```
+
+6→15 geçişi büyük kazanç getirmişti ama 15→25 **tam tersi** —
+pencereyi büyütmenin sınırsız fayda getirmediğini gösteriyor,
+muhtemelen daha uzun pencerede track kalitesinin (ortalama paralaks)
+düşmesi ya da GTSAM prior'unun daha uzun zincirde daha az etkili
+olması yüzünden. **`window: 15`'e geri dönüldü** (doğrulanmış en iyi
+değer, config.yaml'da güncel).
+
+**Yan not — WSL'de arka plan komutu çalıştırırken dikkat:**
+`wsl -d Ubuntu -- bash -c "... && nohup ... & disown; echo started"`
+şeklinde bir komut, `wsl.exe` süreci `"echo started"` sonrası hemen
+kapandığı için compound `&&` zincirinin (kopyalama dahil) hiç
+çalışmadan sessizce iptal olmasına yol açabiliyor (çıktı da yok, hata
+da yok — fark edilmesi zor). Doğru yöntem: Bash aracının kendi
+`run_in_background: true`'sunu **tüm** `wsl -d Ubuntu -- bash -c "..."`
+çağrısını sarmalayacak şekilde kullanmak (komutun içinde ayrıca
+`&`/`nohup` denememek).
+
 ## Oturum notu (22 Eylül) — ctrl+S/overwrite ile kayıp ve kurtarma
 
 Oturum başında `core/motion_estimator.py` (DLT/K fix + retval gate) ve bu

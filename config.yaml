@@ -58,7 +58,7 @@ persistent_ba:
   # (Windows'ta PyPI wheel yok, sadece WSL/Linux'ta calisir). main.py
   # bunu otomatik cagirmaz; ayri bir betikten (refine_trajectory.py)
   # cagrilir.
-  window: 15                    # optimizasyon bloklarinin boyutu (kare)
+  window: 15                    # optimizasyon bloklarinin boyutu (kare) -- 25 denendi, kotu cikti (24 Eylul)
   replenish_threshold: 200       # aktif track sayisi bunun altina dusunce kose ekle
   replenish_exclude_radius: 15   # yeni kose, var olan bir track'e bu kadar yakin olmasin
   min_track_len_in_window: 8     # pencere icindeki kirpilmis parca en az bu kadar uzun olmali
