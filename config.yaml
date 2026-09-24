@@ -59,7 +59,7 @@ persistent_ba:
   # bunu otomatik cagirmaz; ayri bir betikten (refine_trajectory.py)
   # cagrilir.
   window: 15                    # optimizasyon bloklarinin boyutu (kare) -- 25 denendi, kotu cikti (24 Eylul)
-  replenish_threshold: 200       # aktif track sayisi bunun altina dusunce kose ekle
+  replenish_threshold: 50        # aktif track sayisi bunun altina dusunce kose ekle -- tekrar dogrulaniyor (24 Eylul)
   replenish_exclude_radius: 15   # yeni kose, var olan bir track'e bu kadar yakin olmasin
   min_track_len_in_window: 8     # pencere icindeki kirpilmis parca en az bu kadar uzun olmali -- 12 denendi, kotu cikti (24 Eylul)
   max_tracks_per_window: 150

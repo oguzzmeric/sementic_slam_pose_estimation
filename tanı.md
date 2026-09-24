@@ -939,14 +939,33 @@ Sonuç bu aralıkta bu parametreye neredeyse hiç duyarlı değil.
 `pixel_noise_sigma: 1.5`'e (orijinal, fiziksel olarak daha anlamlı
 ORB hassasiyet varsayımı) geri dönüldü — değiştirmenin faydası yok.
 
+**`replenish_threshold` taraması (24 Eylül) — DÜZGÜN OLMAYAN ama
+GERÇEK/TEKRARLANABİLİR bir hassasiyet, yeni en iyi sonuç.**
+
+```
+esik=15    : 66.02 m   (uretimden de kotu)
+esik=50    : 54.86 m   <- EN IYI, iki kez calistirildi, bit-bit ayni sonuc
+esik=100   : 65.07 m   (uretimden de kotu)
+esik=200   : 57.80 m   (onceki en iyi)
+```
+
+Eğri **monoton değil** — 50 keskin bir tek nokta, komşuları (15, 100)
+kötü. İlk bakışta "bu şans mı" diye şüphelendik, `esik=50`'yi ikinci
+kez çalıştırdık: **54.86m, bit-bit aynı sonuç** — yani gürültü değil,
+sistemin bu parametreye karşı gerçek, tekrarlanabilir ama düzgün
+olmayan bir hassasiyeti var (muhtemelen hangi karede/hangi köşelerle
+beslemenin tetiklendiği, hangi kare aralıklarındaki track
+kompozisyonunu değiştirip zincirleme etkiler yaratıyor).
+`replenish_threshold: 50`'ye geçildi (config.yaml'da güncel) —
+**%12.4 iyileşme (62.66m → 54.86m), bugünün yeni en iyi sonucu.**
+
 **Parametre taraması özeti (24 Eylül):** `window` ve `min_track_len_
-in_window` her ikisi de mevcut değerlerden **uzaklaşınca kötüleşti**
-(ikisi de doğrulanmış en iyi değerlere geri döndürüldü);
-`pixel_noise_sigma` duyarsız çıktı. Bu, `window=15, min_track_len_
-in_window=8, pixel_noise_sigma=1.5` (config.yaml'daki güncel hal)
-konfigürasyonunun yerel bir optimum olduğuna işaret ediyor —
-%7.8 iyileşme (62.66m → 57.80m) bugünün doğrulanmış en iyi sonucu
-olarak kalıyor.
+in_window` mevcut değerlerden uzaklaşınca kötüleşti (doğrulanmış en
+iyi değerlere geri döndürüldü); `pixel_noise_sigma` duyarsız çıktı;
+`replenish_threshold` ise düzensiz ama gerçek bir hassasiyetle **yeni
+bir en iyi** (50) buldu. Güncel `config.yaml`: `window=15,
+min_track_len_in_window=8, pixel_noise_sigma=1.5,
+replenish_threshold=50` → **%12.4 iyileşme (62.66m → 54.86m)**.
 
 **Yan not — WSL'de arka plan komutu çalıştırırken dikkat:**
 `wsl -d Ubuntu -- bash -c "... && nohup ... & disown; echo started"`
