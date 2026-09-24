@@ -146,25 +146,42 @@ class Visualizer:
     ) -> None:
         """
         Prints trajectory comparison statistics to console.
+
+        Yarisma spesifikasyonu (Eq. 2) tam 3B, KAYDIRMA/HIZALAMA YOK --
+        est_positions zaten PoseGraph'in rapor ettigi (Sim3 uygulanmis)
+        nihai pozisyon, dogrudan GT ile kiyaslaniyor. Eskiden burada
+        2B + baslangica-kaydirilmis bir hata hesaplanip "Mean error"
+        olarak yarisma metrigiymis gibi basiliyordu -- bu YANLISTI
+        (24 Eylul'de bulundu, bkz. tanı.md). O eski hesap "sekil ATE"
+        olarak asagida ayrica, net bir sekilde yarisma metrigi OLMADIGI
+        belirtilerek tutuluyor -- sistematik bir ofseti gizler ama
+        donuslerin/egrinin ne kadar dogru oldugunu gormek icin faydali.
         """
         if len(est_positions) == 0 or len(gt_positions) == 0:
             print("No valid positions to compare.")
             return
 
         N = min(len(est_positions), len(gt_positions))
-        est = est_positions[:N] - est_positions[0]
-        gt = gt_positions[:N] - gt_positions[0]
+        est = est_positions[:N]
+        gt = gt_positions[:N]
 
-        errors = np.linalg.norm(est[:, :2] - gt[:, :2], axis=1)
-        ate = float(np.sqrt(np.mean(errors ** 2)))
+        comp_errors = np.linalg.norm(est - gt, axis=1)
+        comp_mean = float(np.mean(comp_errors))
+
+        est_shift = est - est[0]
+        gt_shift = gt - gt[0]
+        shape_errors = np.linalg.norm(est_shift[:, :2] - gt_shift[:, :2], axis=1)
+        shape_ate = float(np.sqrt(np.mean(shape_errors ** 2)))
 
         print(f"\n{'='*50}")
         print(f"  TRAJECTORY STATISTICS ({N} frames)")
         print(f"{'='*50}")
-        print(f"  ATE (RMSE)     : {ate:.4f} m")
-        print(f"  Mean error     : {np.mean(errors):.4f} m")
-        print(f"  Max error      : {np.max(errors):.4f} m")
-        print(f"  Min error      : {np.min(errors):.4f} m")
+        print(f"  YARISMA METRIGI (3B, kaydirmasiz) mean : {comp_mean:.4f} m")
+        print(f"  Max error      : {np.max(comp_errors):.4f} m")
+        print(f"  Min error      : {np.min(comp_errors):.4f} m")
+        print(f"{'-'*50}")
+        print(f"  [diagnostik, YARISMA METRIGI DEGIL] sekil ATE (2B, "
+              f"baslangica kaydirilmis): {shape_ate:.4f} m")
         print(f"{'='*50}")
         print(f"  Est final pos  : X={est[-1,0]:.3f}, Y={est[-1,1]:.3f}")
         print(f"  GT  final pos  : X={gt[-1,0]:.3f},  Y={gt[-1,1]:.3f}")
