@@ -994,15 +994,47 @@ sağlıyor:
 `1e-3`'e geçildi — **%48.3 iyileşme (62.66m → 32.38m).** Bu, tek bir
 parametrenin bugün bulduğumuz en büyük tekil kazancı.
 
-**Parametre taraması özeti (24 Eylül, devam ediyor):** `window` ve
-`min_track_len_in_window` mevcut değerlerden uzaklaşınca kötüleşti;
-`pixel_noise_sigma`, `max_tracks_per_window` duyarsız çıktı;
-`replenish_threshold` (50), `parallax_cos_threshold` (0.999),
-`anchor_sigma` (1e-3) üçü de gerçek, büyük kazançlar verdi. Güncel
-`config.yaml`: `window=15, min_track_len_in_window=8, pixel_noise_
-sigma=1.5, replenish_threshold=50, parallax_cos_threshold=0.999,
-anchor_sigma=1e-3` → **%48.3 iyileşme (62.66m → 32.38m)**. Kalan
-denenmemiş: `klt_win_size`, `klt_max_level`, `klt_fb_threshold`.
+**KLT parametreleri (`klt_win_size`, `klt_max_level`, `klt_fb_threshold`)
+— hepsi kötü ya da duyarsız çıktı:**
+
+```
+klt_win_size 63->91      : 59.45 m  (COK KOTU, 63'e geri donuldu)
+klt_max_level 6->8       : 32.38 m  (duyarsiz, 6'da kalindi)
+klt_fb_threshold 1.5->3.0: 60.75 m  (COK KOTU, 1.5'e geri donuldu)
+```
+
+Bu üçü de zaten `klt_debug.py`'de (23 Eylül) dikkatle kalibre edilmişti
+(31→63, 4→6) — o yüzden şaşırtıcı değil, mevcut değerler zaten iyi bir
+noktadaydı.
+
+## TÜM PARAMETRE TARAMASI TAMAMLANDI (24 Eylül) — %48.3 iyileşme
+
+**11 parametrenin hepsi** tek tek denendi. Özet:
+
+| Parametre | Eski | Yeni | Sonuç |
+|---|---|---|---|
+| `window` | 15 | 15 (değişmedi) | 25 denendi, kötü |
+| `min_track_len_in_window` | 8 | 8 (değişmedi) | 12 denendi, kötü |
+| `pixel_noise_sigma` | 1.5 | 1.5 (değişmedi) | duyarsız |
+| `max_tracks_per_window` | 150 | 150 (değişmedi) | duyarsız |
+| `replenish_exclude_radius` | 15 | 15 (değişmedi) | 8 denendi, hafif kötü |
+| `klt_max_level` | 6 | 6 (değişmedi) | duyarsız |
+| `klt_win_size` | 63 | 63 (değişmedi) | 91 denendi, çok kötü |
+| `klt_fb_threshold` | 1.5 | 1.5 (değişmedi) | 3.0 denendi, çok kötü |
+| **`replenish_threshold`** | 200 | **50** | **BÜYÜK KAZANÇ** |
+| **`parallax_cos_threshold`** | 0.99998 | **0.999** | **BÜYÜK KAZANÇ** |
+| **`anchor_sigma`** | 1e-6 | **1e-3** | **EN BÜYÜK KAZANÇ** |
+
+**Final sonuç, tüm en iyi değerlerle bir kez daha doğrulandı:**
+```
+URETIM (duzeltmesiz)  : 62.66 m
+PERSISTENT-MAP BA     : 32.38 m   <- %48.3 iyileşme
+```
+
+Başlangıçtaki %7.8'den (sadece entegrasyon) %48.3'e (tam parametre
+taraması) — 6.2 kat daha büyük bir kazanç. `config.yaml` güncel
+haliyle commit'lendi, `data/trajectory_output_persistent_ba.csv`
+bu ayarlarla üretildi.
 
 **Yan not — WSL'de arka plan komutu çalıştırırken dikkat:**
 `wsl -d Ubuntu -- bash -c "... && nohup ... & disown; echo started"`

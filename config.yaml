@@ -66,9 +66,9 @@ persistent_ba:
   parallax_cos_threshold: 0.999   # 0.99998(eski)=54.86m, 0.995=47.01m, 0.999=45.48m EN IYI (24 Eylul)
   pixel_noise_sigma: 1.5         # ORB eslesme tipik piksel gurultusu -- tum faktorler bunu paylasir -- 3.0 denendi, degisiklik yaratmadi (24 Eylul)
   anchor_sigma: 1.0e-3   # 1e-6=45.48m, 1e-2=57.70m, 1e-1=60.96m hepsi kotu -- 1e-3 EN IYI (24 Eylul)
-  klt_win_size: 63
-  klt_max_level: 6
-  klt_fb_threshold: 1.5          # ileri-geri piksel hatasi esigi
+  klt_win_size: 63   # 91 denendi, cok kotu cikti (24 Eylul)
+  klt_max_level: 6   # 8 denendi, degisiklik yaratmadi (24 Eylul)
+  klt_fb_threshold: 1.5          # ileri-geri piksel hatasi esigi -- 3.0 denendi, cok kotu cikti (24 Eylul)
 logging:
   level: INFO
   log_to_file: false
