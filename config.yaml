@@ -53,6 +53,22 @@ evaluation:
   force_2d: false
   min_sim3_samples: 10
   frame_step: 5
+persistent_ba:
+  # PoseGraph.refine_with_persistent_map -- offline, GTSAM gerektirir
+  # (Windows'ta PyPI wheel yok, sadece WSL/Linux'ta calisir). main.py
+  # bunu otomatik cagirmaz; ayri bir betikten (refine_trajectory.py)
+  # cagrilir.
+  window: 15                    # optimizasyon bloklarinin boyutu (kare)
+  replenish_threshold: 200       # aktif track sayisi bunun altina dusunce kose ekle
+  replenish_exclude_radius: 15   # yeni kose, var olan bir track'e bu kadar yakin olmasin
+  min_track_len_in_window: 8     # pencere icindeki kirpilmis parca en az bu kadar uzun olmali
+  max_tracks_per_window: 150
+  parallax_cos_threshold: 0.99998
+  pixel_noise_sigma: 1.5         # ORB eslesme tipik piksel gurultusu -- tum faktorler bunu paylasir
+  anchor_sigma: 1.0e-6
+  klt_win_size: 63
+  klt_max_level: 6
+  klt_fb_threshold: 1.5          # ileri-geri piksel hatasi esigi
 logging:
   level: INFO
   log_to_file: false

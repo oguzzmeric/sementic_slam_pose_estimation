@@ -376,6 +376,10 @@ class DataLoader:
         """Değerlendirme parametrelerini döndürür."""
         return self.config["evaluation"]
 
+    def get_persistent_ba_config(self) -> dict:
+        """PoseGraph.refine_with_persistent_map için parametreleri döndürür."""
+        return self.config["persistent_ba"]
+
     # ------------------------------------------------------------------
     # Yardımcı metodlar
     # ------------------------------------------------------------------

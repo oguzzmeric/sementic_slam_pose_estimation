@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+import cv2
 import numpy as np
 
 from core.motion_estimator import PoseEstimate
@@ -49,6 +50,224 @@ logger = logging.getLogger(__name__)
 
 class PoseGraphError(Exception):
     pass
+
+
+# ----------------------------------------------------------------------
+# refine_with_persistent_map -- geometrik yardimcilar (self'e ihtiyaci yok)
+# ----------------------------------------------------------------------
+
+def _triangulate(P1: np.ndarray, P2: np.ndarray, pt1: np.ndarray, pt2: np.ndarray) -> Optional[np.ndarray]:
+    A = np.array([
+        pt1[0] * P1[2] - P1[0], pt1[1] * P1[2] - P1[1],
+        pt2[0] * P2[2] - P2[0], pt2[1] * P2[2] - P2[1],
+    ])
+    _, _, Vt = np.linalg.svd(A)
+    Xh = Vt[-1]
+    if abs(Xh[3]) < 1e-9:
+        return None
+    return Xh[:3] / Xh[3]
+
+
+def _triangulate_multiview(Ps: list, pts: list) -> Optional[np.ndarray]:
+    rows = []
+    for P, pt in zip(Ps, pts):
+        rows.append(pt[0] * P[2] - P[0])
+        rows.append(pt[1] * P[2] - P[1])
+    A = np.array(rows)
+    _, _, Vt = np.linalg.svd(A)
+    Xh = Vt[-1]
+    if abs(Xh[3]) < 1e-9:
+        return None
+    return Xh[:3] / Xh[3]
+
+
+def _projection_matrix(K: np.ndarray, R_w: np.ndarray, t_w: np.ndarray) -> np.ndarray:
+    Rt = R_w.T
+    return K @ np.hstack([Rt, -Rt @ t_w.reshape(3, 1)])
+
+
+def _parallax_ok(K: np.ndarray, track: dict, R_init: list, t_init: list, cos_threshold: float) -> bool:
+    """track kendi (start..start+len-1) araligindaki ilk/son gozlemle
+    paralaksini kontrol eder -- pencerenin globalinden degil, kendi
+    yasadigi araliktan."""
+    s = track["start"]
+    e = s + len(track["obs"]) - 1
+    R_first, t_first = R_init[s], t_init[s]
+    R_last, t_last = R_init[e], t_init[e]
+    P_first = _projection_matrix(K, R_first, t_first)
+    P_last = _projection_matrix(K, R_last, t_last)
+    Xw = _triangulate(P_first, P_last, np.array(track["obs"][0]), np.array(track["obs"][-1]))
+    if Xw is None:
+        return False
+    ray1, ray2 = Xw - t_first, Xw - t_last
+    d1, d2 = np.linalg.norm(ray1), np.linalg.norm(ray2)
+    if d1 < 1e-9 or d2 < 1e-9:
+        return False
+    cos_parallax = float(np.dot(ray1, ray2) / (d1 * d2))
+    return cos_parallax <= cos_threshold
+
+
+def _slice_track_to_window(track: dict, w_start: int, w_end: int, min_len: int) -> Optional[dict]:
+    """Global (tum-ucus) track'in [w_start,w_end] penceresiyle kesisen
+    kismini pencere-lokal indekslerle dondurur -- track'in KENDISI
+    pencere sinirini asabilir, burada sadece bu blogun optimizasyonu
+    icin gereken parca kesiliyor."""
+    s = track["start"]
+    e = s + len(track["obs"]) - 1
+    lo, hi = max(s, w_start), min(e, w_end)
+    if lo > hi or (hi - lo + 1) < min_len:
+        return None
+    obs = track["obs"][lo - s: hi - s + 1]
+    return {"start": lo - w_start, "obs": obs}
+
+
+def _build_full_flight_tracks(loader: DataLoader, cam, extractor, cfg: dict) -> list:
+    """
+    TUM UCUS boyunca SUREKLI KLT takibi -- pencere siniri yok. Aktif
+    track sayisi azalinca besleme yapilir (yeni kose eklenir). Bir
+    track sadece takip basarisiz oldugunda (KLT kaybettiginde)
+    sonlanir, herhangi bir optimizasyon penceresi bittigi icin degil
+    -- kalici harita mantigi budur.
+
+    Doner: {'start': kare indeksi, 'obs': [(x,y), ...]} sozluk listesi.
+    """
+    replenish_threshold = int(cfg["replenish_threshold"])
+    replenish_exclude_radius = int(cfg["replenish_exclude_radius"])
+    klt_win = (int(cfg["klt_win_size"]), int(cfg["klt_win_size"]))
+    klt_max_level = int(cfg["klt_max_level"])
+    klt_fb_threshold = float(cfg["klt_fb_threshold"])
+
+    def clean_gray_and_mask(frame_bgr, frame_name):
+        clean = cam.undistort(frame_bgr)
+        gray = cv2.cvtColor(clean, cv2.COLOR_BGR2GRAY)
+        detections = loader.get_detections(frame_name)
+        mask = extractor._build_semantic_mask(gray.shape, detections)
+        return gray, mask
+
+    frame_paths = loader.frame_list
+    finished = []
+
+    gray_prev, mask_prev = clean_gray_and_mask(loader.load_frame(frame_paths[0]), frame_paths[0].name)
+    pts0 = cv2.goodFeaturesToTrack(gray_prev, maxCorners=400, qualityLevel=0.01, minDistance=12, mask=mask_prev)
+    active = [{"start": 0, "obs": [tuple(p[0])]} for p in pts0] if pts0 is not None else []
+
+    lk_params = dict(winSize=klt_win, maxLevel=klt_max_level,
+                      criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+
+    for i in range(1, len(frame_paths)):
+        gray_curr, mask_curr = clean_gray_and_mask(loader.load_frame(frame_paths[i]), frame_paths[i].name)
+
+        if active:
+            pts_in = np.array([a["obs"][-1] for a in active], dtype=np.float32).reshape(-1, 1, 2)
+            pts_curr, st_fwd, _ = cv2.calcOpticalFlowPyrLK(gray_prev, gray_curr, pts_in, None, **lk_params)
+            pts_back, st_bwd, _ = cv2.calcOpticalFlowPyrLK(gray_curr, gray_prev, pts_curr, None, **lk_params)
+            fb_err = np.linalg.norm((pts_in - pts_back).reshape(-1, 2), axis=1)
+            ok = (st_fwd.flatten() == 1) & (st_bwd.flatten() == 1) & (fb_err < klt_fb_threshold)
+
+            new_active = []
+            for j, a in enumerate(active):
+                if ok[j]:
+                    a["obs"].append(tuple(pts_curr[j, 0, :]))
+                    new_active.append(a)
+                elif len(a["obs"]) >= 2:
+                    finished.append(a)
+            active = new_active
+
+        if len(active) < replenish_threshold:
+            excl_mask = mask_curr.copy()
+            for a in active:
+                x, y = a["obs"][-1]
+                cv2.circle(excl_mask, (int(round(x)), int(round(y))), replenish_exclude_radius, 0, -1)
+            n_needed = 400 - len(active)
+            if n_needed > 0:
+                new_pts = cv2.goodFeaturesToTrack(
+                    gray_curr, maxCorners=n_needed, qualityLevel=0.01, minDistance=12, mask=excl_mask)
+                if new_pts is not None:
+                    for p in new_pts:
+                        active.append({"start": i, "obs": [tuple(p[0])]})
+
+        gray_prev = gray_curr
+        if (i % 50) == 0:
+            logger.info("[PoseGraph] persistent-map track: kare %d/%d, aktif=%d, bitmis=%d",
+                        i, len(frame_paths) - 1, len(active), len(finished))
+
+    for a in active:
+        if len(a["obs"]) >= 2:
+            finished.append(a)
+
+    return finished
+
+
+def _solve_window_gtsam(K: np.ndarray, f_focal: float, R_init: list, t_init: list,
+                         tracks: list, confidence: int, cfg: dict):
+    """Bir pencerenin (R_init/t_init baslangic tahminleri + track'ler)
+    GTSAM factor graph'i ile duzeltilmis hali. GTSAM Windows'ta PyPI
+    wheel'i olmadigi icin lazy import -- bu fonksiyon cagrilmadikca
+    (yani refine_with_persistent_map hic cagrilmadikca) gtsam hic
+    gerekmez, normal main.py/Windows akisi bundan etkilenmez."""
+    try:
+        import gtsam
+        from gtsam import Pose3, Rot3, Point3, Cal3_S2
+        from gtsam.symbol_shorthand import X, L
+    except ImportError as e:
+        raise PoseGraphError(
+            "refine_with_persistent_map GTSAM gerektiriyor. GTSAM'in PyPI'da "
+            "Windows wheel'i yok -- bu metodu WSL/Linux'ta calistirin "
+            "(pip install gtsam manylinux wheel ile calisir)."
+        ) from e
+
+    gtsam_K = Cal3_S2(K[0, 0], K[1, 1], 0.0, K[0, 2], K[1, 2])
+    pixel_noise_sigma = float(cfg["pixel_noise_sigma"])
+    anchor_sigma = float(cfg["anchor_sigma"])
+
+    n = len(R_init) - 1
+    graph = gtsam.NonlinearFactorGraph()
+    initial = gtsam.Values()
+    pixel_noise = gtsam.noiseModel.Isotropic.Sigma(2, pixel_noise_sigma)
+    anchor_noise = gtsam.noiseModel.Isotropic.Sigma(6, anchor_sigma)
+
+    for i in range(n + 1):
+        pose_i = Pose3(Rot3(R_init[i]), Point3(t_init[i]))
+        initial.insert(X(i), pose_i)
+        if i == 0:
+            graph.add(gtsam.PriorFactorPose3(X(i), pose_i, anchor_noise))
+        else:
+            rot_sigma = pixel_noise_sigma / (f_focal * np.sqrt(max(confidence, 1)))
+            step_len = float(np.linalg.norm(t_init[i] - t_init[i - 1]))
+            trans_sigma = max(step_len * rot_sigma, 1e-4)
+            sigmas = np.array([rot_sigma] * 3 + [trans_sigma] * 3)
+            graph.add(gtsam.PriorFactorPose3(
+                X(i), pose_i, gtsam.noiseModel.Diagonal.Sigmas(sigmas)))
+
+    Ps_init = [_projection_matrix(K, R_init[i], t_init[i]) for i in range(n + 1)]
+    n_landmarks = 0
+    for tr in tracks:
+        s = tr["start"]
+        obs = [np.array(p) for p in tr["obs"]]
+        Ps_sub = Ps_init[s:s + len(obs)]
+        Xw = _triangulate_multiview(Ps_sub, obs)
+        if Xw is None:
+            continue
+        initial.insert(L(n_landmarks), Point3(Xw))
+        for k, pt in enumerate(obs):
+            graph.add(gtsam.GenericProjectionFactorCal3_S2(
+                pt.astype(np.float64), pixel_noise, X(s + k), L(n_landmarks), gtsam_K))
+        n_landmarks += 1
+
+    if n_landmarks == 0:
+        return R_init, t_init
+
+    params = gtsam.LevenbergMarquardtParams()
+    params.setMaxIterations(50)
+    optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial, params)
+    result = optimizer.optimize()
+
+    R_out, t_out = [], []
+    for i in range(n + 1):
+        p = result.atPose3(X(i))
+        R_out.append(p.rotation().matrix())
+        t_out.append(p.translation())
+    return R_out, t_out
 
 
 @dataclass
@@ -90,6 +309,12 @@ class PoseGraph:
         # (raw_position, GT) pairs collected while GT is available.
         self._local_gt_pairs: List[tuple] = []
         self._sim3_fit: Optional[tuple] = None  # (s, R, t) once fit
+
+        # Per-step local (R, t) history -- kept so refine_with_persistent_map
+        # can re-chain and re-optimize after the fact without re-running the
+        # front-end. Identity/zero for invalid steps, matching update()'s own
+        # no-op behavior for those steps.
+        self._local_steps: List[dict] = []
 
         logger.info(
             "[PoseGraph] Ready -- force_2d=%s, min_sim3_samples=%d",
@@ -179,6 +404,9 @@ class PoseGraph:
                 is_valid=False,
             )
             self._trajectory.append(point)
+            self._local_steps.append(dict(
+                frame_name=frame_name, R_local=np.eye(3), t_local=np.zeros(3), mode="invalid",
+            ))
             return point
 
 
@@ -224,12 +452,142 @@ class PoseGraph:
             is_valid=True,
         )
         self._trajectory.append(point)
+        self._local_steps.append(dict(
+            frame_name=frame_name, R_local=pose.R.copy(), t_local=t_vec.copy(),
+            mode=scale_result.mode,
+        ))
 
         logger.debug(
             "[PoseGraph] %s pos=[%.3f, %.3f, %.3f]",
             frame_name, position[0], position[1], position[2],
         )
         return point
+
+    # ------------------------------------------------------------------
+    # Offline refinement -- persistent-map windowed BA (GTSAM, WSL/Linux only)
+    # ------------------------------------------------------------------
+
+    def refine_with_persistent_map(self, camera_calibration, feature_extractor) -> List[TrajectoryPoint]:
+        """
+        update() ile zaten toplanmis self._local_steps'i (her adimin
+        R_local/t_local'i) alip, TUM UCUS boyunca SUREKLI bir KLT takibi
+        (pencere siniri yok, besleme ile) yapar; ortaya cikan (pencere
+        sinirini asabilen) track'leri, GTSAM windowed BA'ya verirken
+        config.yaml:persistent_ba.window kadar bloklara kirpar.
+
+        Nicin: normal update() akisinda her pencere sifirdan track
+        kuruyordu -- bir pencerenin sonunda hayatta olan bir nokta,
+        sonraki pencerede "hic yasamamis" gibi kaybediliyordu. Bu metot
+        o sinirlamayi kaldirir. Olculen etki (22-24 Eylul, tanı.md):
+        hizalanmamis (yarisma) hata 147.94m -> 141.29m (%4.5 iyilesme),
+        sabit-15-beslemesiz'den (%2.7-3) daha iyi.
+
+        GEREKSINIM: GTSAM. Windows'ta PyPI wheel'i yok -- bu metot
+        SADECE WSL/Linux'ta calisir (main.py/Windows akisi bunu hic
+        cagirmaz, dolayisiyla gtsam'a bagimli degil).
+
+        Returns:
+            Duzeltilmis TrajectoryPoint listesi (self._trajectory
+            DEGISTIRILMEZ -- cagiran taraf save_trajectory'ye bu listeyi
+            ayrica verebilir).
+        """
+        cfg = self._loader.get_persistent_ba_config()
+        window = int(cfg["window"])
+        min_track_len = int(cfg["min_track_len_in_window"])
+        max_tracks = int(cfg["max_tracks_per_window"])
+        parallax_cos_threshold = float(cfg["parallax_cos_threshold"])
+
+        K = camera_calibration.K
+        f_focal = float(np.sqrt(camera_calibration.fx * camera_calibration.fy))
+
+        R_local_all = [s["R_local"] for s in self._local_steps]
+        t_local_all = [s["t_local"] for s in self._local_steps]
+        N = len(self._local_steps)
+
+        logger.info("[PoseGraph] refine_with_persistent_map: surekli KLT takibi baslatiliyor (%d adim)...", N)
+        global_tracks = _build_full_flight_tracks(self._loader, camera_calibration, feature_extractor, cfg)
+        logger.info("[PoseGraph] refine_with_persistent_map: %d track bulundu (medyan uzunluk=%.1f)",
+                     len(global_tracks),
+                     float(np.median([len(t["obs"]) for t in global_tracks])) if global_tracks else 0.0)
+
+        rng = np.random.default_rng(0)
+        R_local_corr = [r.copy() for r in R_local_all]
+        t_local_corr = [t.copy() for t in t_local_all]
+
+        R0, t0 = np.eye(3), np.zeros(3)
+        start = 0
+        while start < N - 1:
+            n = min(window - 1, N - 1 - start)
+            end = start + n
+
+            R_init = [R0.copy()]
+            t_init = [t0.copy()]
+            for i in range(n):
+                t_init.append(t_init[-1] + R_init[-1] @ t_local_all[start + i])
+                R_init.append(R_init[-1] @ R_local_all[start + i])
+
+            win_tracks = []
+            for tr in global_tracks:
+                sliced = _slice_track_to_window(tr, start, end, min_track_len)
+                if sliced is not None and _parallax_ok(K, sliced, R_init, t_init, parallax_cos_threshold):
+                    win_tracks.append(sliced)
+
+            if not win_tracks:
+                R0, t0 = R_init[-1], t_init[-1]
+                start = end
+                continue
+
+            if len(win_tracks) > max_tracks:
+                idx = rng.choice(len(win_tracks), max_tracks, replace=False)
+                win_tracks = [win_tracks[i] for i in idx]
+
+            R_out, t_out = _solve_window_gtsam(K, f_focal, R_init, t_init, win_tracks, len(win_tracks), cfg)
+
+            for i in range(n):
+                R_local_corr[start + i] = R_out[i].T @ R_out[i + 1]
+                t_local_corr[start + i] = R_out[i].T @ (t_out[i + 1] - t_out[i])
+
+            R0, t0 = R_out[-1], t_out[-1]
+            start = end
+
+        # yeniden zincirle, warmup adimlarindaki (duzeltilmis raw, GT) ciftleriyle
+        # Sim(3)'u YENIDEN uydur -- duzeltilmis zincir orijinalinden farkli.
+        R_world = np.eye(3)
+        t_world = np.zeros(3)
+        gt_pairs = []
+        raw_positions = []
+        for i, step in enumerate(self._local_steps):
+            t_world = t_world + R_world @ t_local_corr[i]
+            R_world = R_world @ R_local_corr[i]
+            raw_positions.append(t_world.copy())
+            if step["mode"] == "warmup":
+                gt = self._loader.get_ground_truth(step["frame_name"])
+                if gt is not None:
+                    gt_pairs.append((t_world.copy(), gt.as_vector()))
+
+        sim3 = None
+        if len(gt_pairs) >= self._min_sim3_samples:
+            P = np.array([p[0] for p in gt_pairs])
+            Q = np.array([p[1] for p in gt_pairs])
+            sim3 = self._umeyama(P, Q)
+
+        refined: List[TrajectoryPoint] = []
+        for i, step in enumerate(self._local_steps):
+            gt = self._loader.get_ground_truth(step["frame_name"])
+            if step["mode"] == "warmup" and gt is not None:
+                position = gt.as_vector().copy()
+            elif sim3 is not None:
+                s, R, t = sim3
+                position = s * (R @ raw_positions[i]) + t
+            else:
+                position = raw_positions[i].copy()
+            refined.append(TrajectoryPoint(
+                frame_name=step["frame_name"], frame_idx=i + 1, position=position,
+                R_world=np.eye(3), scale=0.0, mode=step["mode"],
+                is_valid=(step["mode"] != "invalid"),
+            ))
+
+        return refined
 
     # ------------------------------------------------------------------
     # Trajectory access
@@ -301,14 +659,15 @@ class PoseGraph:
         logger.info("[PoseGraph] ATE(%dD) = %.4f m (%d points)", dims, ate, N)
         return ate
 
-    def save_trajectory(self, output_path: str) -> None:
+    def save_trajectory(self, output_path: str, trajectory: Optional[List[TrajectoryPoint]] = None) -> None:
         path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        points = trajectory if trajectory is not None else self._trajectory
 
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["frame_name", "x", "y", "z", "scale", "mode", "is_valid"])
-            for point in self._trajectory:
+            for point in points:
                 writer.writerow([
                     point.frame_name,
                     f"{point.position[0]:.6f}",
@@ -319,7 +678,7 @@ class PoseGraph:
                     point.is_valid,
                 ])
 
-        logger.info("[PoseGraph] Saved: %s (%d points)", path, len(self._trajectory))
+        logger.info("[PoseGraph] Saved: %s (%d points)", path, len(points))
 
     def __repr__(self) -> str:
         fit = "pending" if self._sim3_fit is None else f"s={self._sim3_fit[0]:.4f}"

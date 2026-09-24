@@ -103,14 +103,57 @@ SuperPoint, BF yerine LightGlue takılacak ve aşağı akış etkilenmemeli.
 E = (1/N) Σ sqrt((x̂−x)² + (ŷ−y)² + (ẑ−z)²)
 ```
 
-Sim(3) değil, RMSE değil. `main.py` şu an RMSE veriyor; yarışma için
-ortalama da raporlanmalı.
+Sim(3) değil, RMSE değil, **kaydırma/yeniden-hizalama YOK**. `main.py`
+şu an RMSE veriyor; yarışma için ortalama da raporlanmalı.
 
-## Mevcut durum (22 Eylül, 450 kare, DLT fix + retval gate + Umeyama Sim(3) + flow-scale)
+**⚠️ DÜZELTME (24 Eylül) — bu spesifikasyon 2 gün boyunca YANLIŞ
+uygulanmıştı, aşağıdaki tüm "HIZALANMAMIS mean" rakamları şüpheli:**
+
+`main.py`'nin bastığı "Mean error" (`utils/visualizer.py::print_statistics`)
+gerçekte şunu hesaplıyor: **sadece X-Y (2B)**, ve **her iki trajectory'yi
+de kendi başlangıç noktasına göre kaydırarak** (`est - est[0]`,
+`gt - gt[0]`). Bu, yukarıdaki Eşitlik 2'den (tam 3B, kaydırmasız)
+**farklı ve daha kolay** bir metrik — sistematik bir ofset varsa onu
+gizliyor, Z eksenini (irtifa hatasını) hiç saymıyor.
+
+Aynı `data/trajectory_output.csv` üzerinde ikisini yan yana ölçünce:
+```
+main.py'nin gosterdigi (2B, baslangica kaydirilmis)      : 21.11 m
+GERCEK yarisma metrigi (3B, kaydirmasiz, tam spesifikasyon): 62.66 m
+```
+
+Yani bu dosyadaki (ve `YONTEMLER_OZETI.txt`'deki) **tüm "HIZALANMAMIS
+mean" 23-25m aralığındaki rakamlar** muhtemelen bu yanlış (2B+kaydırılmış)
+formülle ölçülmüş — gerçek sayı daha yüksek. Diagnostic script'lerin
+(`bacheck.py`, `longtrack_gtsam.py` vb.) kendi "HIZALANMAMIS mean"i
+(137-165m) de doğru değil — onlar Sim(3) düzeltmesi UYGULANMADAN önceki
+ham lokal-çerçeve pozisyonunu GT ile kıyaslıyordu (elmayla armut).
+**Doğru ölçüm için:** `PoseGraph`'ın gerçekte rapor ettiği (`p.position`
+— Sim3 uygulanmış) pozisyonu, tam 3B, hiçbir kaydırma olmadan GT ile
+kıyaslamak gerekiyor (`refine_trajectory.py::mean_error()` bunu doğru
+yapıyor).
+
+Geriye dönük olarak eski "220m→23m" hikayesini bu doğru metrikle
+yeniden ölçmedik (eski kod durumuna dönmek gerekir) — ama göreceli
+iyileşmeler (Umeyama Sim3 entegrasyonu, flow-scale, persistent map)
+muhtemelen yönleri doğru, sadece mutlak sayılar yanlıştı.
+
+## Mevcut durum (24 Eylül, DOĞRU metrikle yeniden ölçüldü)
+
+```
+                                    URETIM      KALICI HARITA BA
+Gercek yarisma metrigi (3B, kaydirmasiz)   62.66 m     57.80 m    <- %7.8 iyilesme
+```
+
+Bu, `refine_trajectory.py` (core/pose_graph.py'ye entegre edilen
+`refine_with_persistent_map`) ile ölçüldü — bkz. "24 Eylül entegrasyon"
+bölümü aşağıda.
+
+## Mevcut durum (22 Eylül, YANLIŞ metrikle — sadece tarihsel referans)
 
 ```
 geçerli poz            : 444 / 450
-HIZALANMAMIS mean      : 23.12 m     <- flow-scale kalibrasyonuyla, once 25.37 m
+HIZALANMAMIS mean      : 23.12 m     <- YANLIŞ METRİK (2B+kaydırılmış, bkz. yukarı)
 Sim(3) ATE (evo)       : 24.03 m     (flow-scale oncesi: 26.15 m)
 SE(3) rigid ATE (evo)  : 26.59 m     (flow-scale oncesi: 27.55 m)
 olcek faktoru          : 0.8744      (flow-scale oncesi: 1.1242)
@@ -122,7 +165,9 @@ kötü olmasından değil, **yanlış koordinat çerçevesinde raporlamaktan**
 kaynaklanıyormuş (`swap_xy`/`flip_y` kaba tahmini + skaler `k`). Bkz.
 aşağıdaki "Umeyama Sim(3) entegrasyonu" bölümü. Alttaki yön hatası (~20-27°)
 **hâlâ açık** — ama artık bunun üzerindeki her iyileştirme doğrudan nihai
-metriğe yansıyacak.
+metriğe yansıyacak. (Not: "23.12m" rakamının kendisi yukarıdaki düzeltmeye
+göre şüpheli, ama flow-scale'in GÖRECELİ etkisi -- 25.37m'den iyileşme --
+muhtemelen hâlâ geçerli, çünkü ikisi de AYNI [yanlış] metrikle ölçüldü.)
 
 ## Son düzeltme (21 Eylül) — DLT triangulation hatası
 
@@ -788,6 +833,49 @@ yeniden-yakalama zaten "Faz B" olarak planlıydı) ile sistematik hatayı
 gerçekten düzeltmek.
 (c) burada durup dürüstçe belgeleyip projenin sunum/temizlik tarafına
 geçmek — her zaman elde bir "yeterince iyi" durak noktası.
+
+## 24 Eylül entegrasyonu — persistent map artık `core/pose_graph.py`'de
+
+Kullanıcı isteğiyle `persistmap_gtsam.py` (tek kullanımlık diagnostic)
+`core/pose_graph.py`'ye taşındı:
+
+- **`PoseGraph.__init__`/`update()`:** her adımı (`R_local`, `t_local`,
+  `mode`, `frame_name`) `self._local_steps`'e kaydediyor artık — bu,
+  `refine_with_persistent_map`'in sonradan yeniden zincirleyebilmesi
+  için gerekli, online akışı (mevcut davranışı) DEĞİŞTİRMİYOR.
+- **`PoseGraph.refine_with_persistent_map(camera_calibration,
+  feature_extractor)`:** yeni public metot. Tüm uçuş boyunca sürekli
+  KLT takibi (`_build_full_flight_tracks`) + 15'er karelik bloklarda
+  GTSAM BA (`_solve_window_gtsam`) yapıp düzeltilmiş bir
+  `List[TrajectoryPoint]` döndürüyor. `self._trajectory`'yi
+  DEĞİŞTİRMİYOR (çağıran taraf `save_trajectory(path, trajectory=...)`
+  ile ayrıca kaydediyor).
+- **GTSAM lazy import, guard'lı:** `import gtsam` sadece bu metot
+  çağrıldığında çalışıyor, `try/except ImportError` ile net bir hata
+  mesajı veriyor ("WSL/Linux'ta çalıştırın"). Normal `main.py`/Windows
+  akışı `core/pose_graph.py`'yi import ettiğinde gtsam'a hiç
+  ihtiyaç duymuyor — Windows'ta hiçbir şey bozulmadı.
+- **`config.yaml:persistent_ba`** yeni bölüm — tüm eşikler (pencere
+  boyutu, besleme, min track uzunluğu, piksel gürültüsü vb.) buradan
+  okunuyor, hardcode yok.
+- **`utils/data_loader.py::get_persistent_ba_config()`** eklendi
+  (diğer `get_X_config()` metotlarıyla aynı desen).
+- **`refine_trajectory.py`** (repo kökü) — sürücü betik: üretim
+  pipeline'ını çalıştırır, `refine_with_persistent_map`'i çağırır,
+  ikisini karşılaştırır. SADECE WSL'de çalışır.
+
+**Bu entegrasyon sırasında yukarıdaki metrik hatası bulundu** (bkz.
+"Yarışma metriği" bölümü) — `refine_trajectory.py`'nin karşılaştırması
+ilk defa spesifikasyonu harfiyen uyguladığı için ortaya çıktı.
+
+**Doğru metrikle ölçülen entegrasyon sonucu:**
+```
+URETIM (duzeltmesiz)     : 62.66 m
+PERSISTENT-MAP BA        : 57.80 m   (%7.8 iyilesme)
+```
+
+`data/trajectory_output_persistent_ba.csv` olarak kaydediliyor,
+`data/trajectory_output.csv` (üretim) değişmiyor.
 
 ## Oturum notu (22 Eylül) — ctrl+S/overwrite ile kayıp ve kurtarma
 
