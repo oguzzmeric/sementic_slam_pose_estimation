@@ -927,6 +927,27 @@ Filtreyi sıkılaştırmak, kalan track sayısını çok azaltıp (yeterli
 çeşitlilik/kapsam kalmadı) sonucu üretimden bile kötüleştirdi.
 `min_track_len_in_window: 8`'e geri dönüldü (doğrulanmış en iyi).
 
+**`pixel_noise_sigma` taraması (24 Eylül) — DUYARSIZ.** 1.5'ten 3.0'a
+(iki katına) çıkarıldı:
+
+```
+                       URETIM      sigma=1.5    sigma=3.0
+PERSISTENT-MAP BA       62.66 m     57.80 m      57.84 m   <- pratikte ayni
+```
+
+Sonuç bu aralıkta bu parametreye neredeyse hiç duyarlı değil.
+`pixel_noise_sigma: 1.5`'e (orijinal, fiziksel olarak daha anlamlı
+ORB hassasiyet varsayımı) geri dönüldü — değiştirmenin faydası yok.
+
+**Parametre taraması özeti (24 Eylül):** `window` ve `min_track_len_
+in_window` her ikisi de mevcut değerlerden **uzaklaşınca kötüleşti**
+(ikisi de doğrulanmış en iyi değerlere geri döndürüldü);
+`pixel_noise_sigma` duyarsız çıktı. Bu, `window=15, min_track_len_
+in_window=8, pixel_noise_sigma=1.5` (config.yaml'daki güncel hal)
+konfigürasyonunun yerel bir optimum olduğuna işaret ediyor —
+%7.8 iyileşme (62.66m → 57.80m) bugünün doğrulanmış en iyi sonucu
+olarak kalıyor.
+
 **Yan not — WSL'de arka plan komutu çalıştırırken dikkat:**
 `wsl -d Ubuntu -- bash -c "... && nohup ... & disown; echo started"`
 şeklinde bir komut, `wsl.exe` süreci `"echo started"` sonrası hemen

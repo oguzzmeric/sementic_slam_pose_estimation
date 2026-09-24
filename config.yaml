@@ -64,7 +64,7 @@ persistent_ba:
   min_track_len_in_window: 8     # pencere icindeki kirpilmis parca en az bu kadar uzun olmali -- 12 denendi, kotu cikti (24 Eylul)
   max_tracks_per_window: 150
   parallax_cos_threshold: 0.99998
-  pixel_noise_sigma: 1.5         # ORB eslesme tipik piksel gurultusu -- tum faktorler bunu paylasir
+  pixel_noise_sigma: 1.5         # ORB eslesme tipik piksel gurultusu -- tum faktorler bunu paylasir -- 3.0 denendi, degisiklik yaratmadi (24 Eylul)
   anchor_sigma: 1.0e-6
   klt_win_size: 63
   klt_max_level: 6
