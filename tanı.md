@@ -959,13 +959,50 @@ kompozisyonunu değiştirip zincirleme etkiler yaratıyor).
 `replenish_threshold: 50`'ye geçildi (config.yaml'da güncel) —
 **%12.4 iyileşme (62.66m → 54.86m), bugünün yeni en iyi sonucu.**
 
-**Parametre taraması özeti (24 Eylül):** `window` ve `min_track_len_
-in_window` mevcut değerlerden uzaklaşınca kötüleşti (doğrulanmış en
-iyi değerlere geri döndürüldü); `pixel_noise_sigma` duyarsız çıktı;
-`replenish_threshold` ise düzensiz ama gerçek bir hassasiyetle **yeni
-bir en iyi** (50) buldu. Güncel `config.yaml`: `window=15,
-min_track_len_in_window=8, pixel_noise_sigma=1.5,
-replenish_threshold=50` → **%12.4 iyileşme (62.66m → 54.86m)**.
+**`parallax_cos_threshold` taraması — BÜYÜK KAZANÇ.** Eski değer
+(0.99998) neredeyse hiç filtrelemiyordu. Sıkılaştırınca:
+
+```
+esik=0.99998 (eski) : 54.86 m
+esik=0.999          : 45.48 m   <- EN IYI
+esik=0.995          : 47.01 m   (biraz daha kotu)
+```
+
+`0.999`'a geçildi — düşük-paralaks (güvenilmez üçgenleme) track'lerini
+elemek gerçekten büyük fark yaratıyor. **%27.4 iyileşme (62.66m →
+45.48m).**
+
+**`max_tracks_per_window` (150→300) — DUYARSIZ.** 45.54m (150'nin
+45.48m'sinden farksız) — paralaks filtresi zaten sıkılaştığı için
+tavan hiç devreye girmiyor. 150'de kalındı.
+
+**`replenish_exclude_radius` (15→8) — hafif kötü.** 45.72m. 15'te
+kalındı.
+
+**`anchor_sigma` taraması — EN BÜYÜK KAZANÇ.** Her pencerenin ilk
+karesi, önceki pencerenin sonucuna göre neredeyse tamamen sabitti
+(1e-6). Bunu gevşetmek zincirdeki erken hataların da düzeltilebilmesini
+sağlıyor:
+
+```
+1e-6 (eski) : 45.48 m
+1e-3        : 32.38 m   <- EN IYI, keskin bir tepe
+1e-2        : 57.70 m   (cok kotu)
+1e-1        : 60.96 m   (URETIMDEN DE KOTU)
+```
+
+`1e-3`'e geçildi — **%48.3 iyileşme (62.66m → 32.38m).** Bu, tek bir
+parametrenin bugün bulduğumuz en büyük tekil kazancı.
+
+**Parametre taraması özeti (24 Eylül, devam ediyor):** `window` ve
+`min_track_len_in_window` mevcut değerlerden uzaklaşınca kötüleşti;
+`pixel_noise_sigma`, `max_tracks_per_window` duyarsız çıktı;
+`replenish_threshold` (50), `parallax_cos_threshold` (0.999),
+`anchor_sigma` (1e-3) üçü de gerçek, büyük kazançlar verdi. Güncel
+`config.yaml`: `window=15, min_track_len_in_window=8, pixel_noise_
+sigma=1.5, replenish_threshold=50, parallax_cos_threshold=0.999,
+anchor_sigma=1e-3` → **%48.3 iyileşme (62.66m → 32.38m)**. Kalan
+denenmemiş: `klt_win_size`, `klt_max_level`, `klt_fb_threshold`.
 
 **Yan not — WSL'de arka plan komutu çalıştırırken dikkat:**
 `wsl -d Ubuntu -- bash -c "... && nohup ... & disown; echo started"`
