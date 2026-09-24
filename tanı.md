@@ -915,6 +915,18 @@ düşmesi ya da GTSAM prior'unun daha uzun zincirde daha az etkili
 olması yüzünden. **`window: 15`'e geri dönüldü** (doğrulanmış en iyi
 değer, config.yaml'da güncel).
 
+**`min_track_len_in_window` taraması (24 Eylül) — sıkılaştırmak DAHA DA KÖTÜLEŞTİRDİ.**
+8'den (pencerenin yarısı) 12'ye (%80'i) çıkarıldı:
+
+```
+                       URETIM      min_len=8    min_len=12
+PERSISTENT-MAP BA       62.66 m     57.80 m      66.62 m   <- URETIMDEN BILE KOTU
+```
+
+Filtreyi sıkılaştırmak, kalan track sayısını çok azaltıp (yeterli
+çeşitlilik/kapsam kalmadı) sonucu üretimden bile kötüleştirdi.
+`min_track_len_in_window: 8`'e geri dönüldü (doğrulanmış en iyi).
+
 **Yan not — WSL'de arka plan komutu çalıştırırken dikkat:**
 `wsl -d Ubuntu -- bash -c "... && nohup ... & disown; echo started"`
 şeklinde bir komut, `wsl.exe` süreci `"echo started"` sonrası hemen
